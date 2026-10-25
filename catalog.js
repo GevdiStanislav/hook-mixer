@@ -89,7 +89,7 @@ export const DEFAULTS = {
   font: 'montserrat',
   text: { color: '#FFFFFF', style: 'box', boxColor: '#000000', size: 'm', position: 'top', upper: false, seconds: 3 },
   anim: 'pop',
-  subs: { enabled: true, color: '#FFFFFF', style: 'outline', size: 'm' },
+  subs: { source: 'srt', model: 'base', lang: 'ukrainian', words: 3, highlight: '#FFD60A', position: 'bottom', color: '#FFFFFF', style: 'outline', size: 'm' },
   transition: { type: 'none', duration: 0.4 },
   fx: { grade: 'none', vignette: false, grain: false, sharpen: false, hookZoom: false, hookShake: false, progress: false, progressColor: '#3DDC97' },
   audio: { music: true, musicVol: 0.25, origVol: 1, sfxVol: 0.8, sfxTransition: 'whoosh', sfxHook: 'none', sfxText: 'none', loudnorm: false },

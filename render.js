@@ -134,6 +134,7 @@ function fitChain(cfg, W, H, inLabel, outLabel) {
 }
 
 function subtitleFilter(cfg, H, srtName) {
+  if (/\.ass$/i.test(srtName)) return `subtitles=${srtName}:fontsdir=/fonts`; // auto captions carry their own style
   const s = cfg.subs;
   // SRT is rendered on a 288-unit-high canvas, so the size is a share of the frame height
   const size = Math.round(288 * ({ s: 0.045, m: 0.058, l: 0.075 }[s.size || 'm']));

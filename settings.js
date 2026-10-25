@@ -15,6 +15,8 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 
 let cfg = clone(DEFAULTS);
 try { cfg = merge(DEFAULTS, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch (e) { /* storage unavailable */ }
+// older saved settings had subs.enabled instead of subs.source
+if (cfg.subs.enabled !== undefined) { if (cfg.subs.enabled === false) cfg.subs.source = 'none'; delete cfg.subs.enabled; }
 let onChange = () => {};
 
 export const getCfg = () => cfg;
@@ -42,7 +44,7 @@ function swatches(path) {
   const cur = String(get(path)).toUpperCase();
   return `<div class="swatches" data-path="${path}">${COLORS.map((c) =>
     `<button type="button" class="sw${c === cur ? ' on' : ''}" data-val="${c}" style="background:${c}" aria-label="${c}"></button>`).join('')}
-    <label class="sw custom" title="Свій колір"><input type="color" value="${esc(cur)}" data-path="${path}" data-kind="color"></label></div>`;
+    <label class="sw custom" title="Свій колір"><input type="color" value="${/^#[0-9A-F]{6}$/.test(cur) ? cur : '#FFFFFF'}" data-path="${path}" data-kind="color"></label></div>`;
 }
 function seg(path, opts) {
   const cur = String(get(path));
@@ -77,11 +79,23 @@ const TABS = [
     toggle('text.upper', 'ВЕЛИКІ ЛІТЕРИ') +
     range('text.seconds', 'Скільки показувати текстовий хук', 1, 8, 0.5, secs)],
   ['anim', 'Анімація', () => `<p class="hint">Як зʼявляється текст хука й CTA.</p>` + tiles('anim', ANIMATIONS)],
-  ['subs', 'Субтитри', () => `<p class="hint">Якщо поруч із відео в папці лежить файл субтитрів з такою ж назвою (наприклад <code>video1.mp4</code> + <code>video1.srt</code>), вони вшиваються у відео. Шрифт той самий, що у вкладці «Шрифт».</p>` +
-    toggle('subs.enabled', 'Вшивати субтитри з .srt') +
-    field('Колір', swatches('subs.color')) +
-    field('Стиль', tiles('subs.style', TEXT_STYLES)) +
-    field('Розмір', seg('subs.size', [['s', 'Малий'], ['m', 'Середній'], ['l', 'Великий']]))],
+  ['subs', 'Субтитри', () => {
+    const src = cfg.subs.source || (cfg.subs.enabled === false ? 'none' : 'srt');
+    return field('Звідки брати субтитри', tiles('subs.source', [
+      { id: 'none', name: 'Без субтитрів', note: '' },
+      { id: 'srt', name: 'З файлу .srt', note: 'Файл поруч із відео з тією ж назвою' },
+      { id: 'auto', name: 'Автоматично', note: 'Розпізнати голос (є .srt — візьме його)' },
+    ])) +
+    (src === 'auto' ? `<p class="hint">Розпізнавання працює прямо у браузері. Перший раз завантажиться модель (Швидка ≈130 МБ, Точна ≈250 МБ), далі вона береться з кешу. Після монтажу субтитри можна завантажити як .srt, виправити й покласти поруч із відео на Drive — тоді візьмуться вже виправлені.</p>` +
+      field('Модель', seg('subs.model', [['base', 'Швидка'], ['small', 'Точна']])) +
+      field('Мова відео', seg('subs.lang', [['ukrainian', 'Українська'], ['english', 'Англійська'], ['russian', 'Російська'], ['slovak', 'Словацька'], ['auto', 'Визначити сама']])) +
+      field('Слів на екрані одночасно', seg('subs.words', [[1, '1'], [2, '2'], [3, '3'], [4, '4']])) +
+      field('Підсвітка слова, яке звучить', `<div class="swrow"><div class="swatches" data-path="subs.highlight"><button type="button" class="sw none${cfg.subs.highlight === 'none' ? ' on' : ''}" data-val="none" title="Без підсвітки">✕</button></div>` + swatches('subs.highlight') + '</div>') +
+      field('Позиція', seg('subs.position', [['bottom', 'Внизу'], ['center', 'По центру']])) : '') +
+    (src !== 'none' ? field('Колір', swatches('subs.color')) + field('Стиль', tiles('subs.style', TEXT_STYLES)) +
+      field('Розмір', seg('subs.size', [['s', 'Малий'], ['m', 'Середній'], ['l', 'Великий']])) +
+      `<p class="hint">Шрифт той самий, що у вкладці «Шрифт».</p>` : '');
+  }],
   ['trans', 'Переходи', () => tiles('transition.type', TRANSITIONS, (t) => `<span class="tprev tp-${t.id}"><i></i><i></i></span><b>${esc(t.name)}</b><small>${esc(t.note)}</small>`) +
     range('transition.duration', 'Тривалість переходу', 0.2, 1, 0.05, secs)],
   ['fx', 'Ефекти', () =>

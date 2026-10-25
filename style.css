@@ -108,3 +108,6 @@ code{background:#0f0a1a;padding:1px 6px;border-radius:6px;font-size:.85em}
 .g-warm{filter:sepia(.35) saturate(1.2)}.g-cool{filter:hue-rotate(25deg) saturate(.9) brightness(.95)}.g-vintage{filter:sepia(.55) contrast(.9) saturate(.8)}
 .g-matte{filter:contrast(.8) brightness(1.08) saturate(.85)}.g-bw{filter:grayscale(1) contrast(1.15)}
 @media (prefers-reduced-motion:reduce){.tprev i{animation:none!important}}
+.sw.none{background:#0f0a1a;color:var(--muted);font-size:.85rem;line-height:1}
+.result .dl{display:inline-block;margin:0 0 12px;color:var(--g);font-size:.9rem}
+.swrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}

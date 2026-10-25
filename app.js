@@ -1,6 +1,7 @@
 import { FFmpeg } from './vendor/ffmpeg/index.js';
 import { mountSettings, getCfg } from './settings.js';
-import { renderSegment, assemble, loadFont, previewFrame } from './render.js';
+import { renderSegment, assemble, loadFont, previewFrame, dims } from './render.js';
+import { transcribe, extractAudio, wordsFromChunks, groupCaptions, buildAss, buildSrt } from './captions.js';
 
 const $ = (s) => document.querySelector(s);
 const DRIVE = 'https://www.googleapis.com/drive/v3/files';
@@ -328,6 +329,7 @@ async function makeOne(ff, n, total) {
 
   await loadFont(ff, cfg);
   const segs = [];
+  const transcripts = [];
   for (let i = 0; i < jobs.length; i++) {
     const j = jobs[i];
     const label = `Ролик ${n}/${total} · крок ${i + 1}/${jobs.length + 1}`;
@@ -337,8 +339,16 @@ async function makeOne(ff, n, total) {
     await ff.writeFile(input, bytes.slice()); // copy: ffmpeg takes ownership of the buffer, the cache keeps the original
     if (!j.isHook || !hook.clip) lastSource = { name: j.src.name, bytes }; // background for the style preview
     let srt = null;
-    const srtItem = cfg.subs.enabled && pool.srts.get(baseName(j.src.name));
-    if (srtItem) { srt = `sub${i}.srt`; await ff.writeFile(srt, (await srtItem.get()).slice()); }
+    const srtItem = cfg.subs.source !== 'none' && pool.srts.get(baseName(j.src.name));
+    if (srtItem) { srt = `sub${i}.srt`; await ff.writeFile(srt, (await srtItem.get()).slice()); } else if (cfg.subs.source === 'auto' && !isImage(j.src)) {
+      const caps = await autoCaptions(ff, input, j, cfg, label);
+      if (caps.length) {
+        const { W, H } = dims(cfg);
+        srt = `sub${i}.ass`;
+        await ff.writeFile(srt, buildAss(caps, cfg, W, H));
+        transcripts.push({ name: j.src.name, srt: buildSrt(caps) });
+      }
+    }
     status(`${label}: монтую «${j.src.name}»…`);
     segs.push(await renderSegment(ff, logLines, cfg, { input, name: j.src.name, maxSec: j.maxSec, isHook: j.isHook, text: j.text, srt }, `seg${i}.mp4`));
     await ff.deleteFile(input);
@@ -363,10 +373,30 @@ async function makeOne(ff, n, total) {
   const data = await ff.readFile(out);
   for (const s of segs) await ff.deleteFile(s.output);
   await ff.deleteFile(out);
-  return { blob: new Blob([data.buffer], { type: 'video/mp4' }), hook, videos, music: extras.musicName };
+  return { blob: new Blob([data.buffer], { type: 'video/mp4' }), hook, videos, music: extras.musicName, transcripts };
 }
 
-function showResult({ blob, hook, videos, music }) {
+// speech → words (cached per file, model, language and length)
+const wordCache = new Map();
+async function autoCaptions(ff, input, job, cfg, label) {
+  const key = [job.src.name, cfg.subs.model, cfg.subs.lang, job.maxSec].join('|');
+  if (!wordCache.has(key)) {
+    status(`${label}: витягую звук для субтитрів…`);
+    const audio = await extractAudio(ff, input, job.maxSec);
+    if (!audio || audio.length < 16000 * 0.3) { wordCache.set(key, []); return []; }
+    const res = await transcribe(audio, { model: cfg.subs.model, language: cfg.subs.lang }, (p) => {
+      if (p.type === 'loading') status(`Завантажую модель розпізнавання мови: ${Math.round((p.loaded / p.total) * 100)}% (${(p.total / 1048576).toFixed(0)} МБ, тільки перший раз)`);
+      if (p.type === 'working') status(`${label}: розпізнаю мову в «${job.src.name}»…`);
+    });
+    wordCache.set(key, wordsFromChunks(res.chunks));
+  }
+  const words = wordCache.get(key);
+  const { W, H } = dims(cfg);
+  const fs = Math.min(W, H) * ({ s: 0.055, m: 0.07, l: 0.09 }[cfg.subs.size || 'm']);
+  return groupCaptions(words, +cfg.subs.words || 3, Math.max(8, Math.floor((W * 0.86) / (fs * 0.62))));
+}
+
+function showResult({ blob, hook, videos, music, transcripts = [] }) {
   const url = URL.createObjectURL(blob);
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
   const el = document.createElement('div');
@@ -382,6 +412,7 @@ function showResult({ blob, hook, videos, music }) {
         ${videos.map((v) => `<li>Відео: ${esc(v.name)}</li>`).join('')}
         ${music ? `<li>Музика: ${esc(music)}</li>` : ''}
       </ul>
+      ${transcripts.map((t) => `<a class="dl" href="${URL.createObjectURL(new Blob([t.srt], { type: 'text/plain' }))}" download="${esc(t.name.replace(/\.[^.]+$/, ''))}.srt">⬇ Субтитри ${esc(t.name)} (.srt)</a><br>`).join('')}
       <a class="btn" href="${url}" download="junction_mix_${stamp}.mp4">Завантажити MP4</a>
     </div>`;
   $('#results').prepend(el);
