@@ -1,19 +1,23 @@
 import { FFmpeg } from './vendor/ffmpeg/index.js';
+import { mountSettings, getCfg } from './settings.js';
+import { renderSegment, assemble, loadFont, previewFrame } from './render.js';
 
 const $ = (s) => document.querySelector(s);
 const DRIVE = 'https://www.googleapis.com/drive/v3/files';
-const FIELDS = ['apiKey', 'mainFolder', 'manualHooks', 'count', 'batch', 'hookMode', 'quality', 'maxSec', 'hookSec'];
+const FIELDS = ['apiKey', 'mainFolder', 'manualHooks', 'count', 'batch', 'hookMode', 'maxSec', 'hookSec'];
 // головна папка Junction на Google Drive (можна змінити на сайті)
 const DEFAULT_MAIN_FOLDER = 'https://drive.google.com/drive/folders/1yoCiuF8Mm6rOSPf482WToMDBtfQIludH';
 
 let mode = 'drive';
-// pool: hook clips, text hooks from files, main videos
-const pool = { clips: [], texts: [], videos: [] };
+// clips = video/photo hooks, texts = text hooks, videos = main videos, srts = subtitles by base name
+const pool = { clips: [], texts: [], videos: [], music: [], logos: [], srts: new Map() };
+const local = { music: null, logo: null };
 const cache = new Map();
 let ffmpeg = null;
 let logLines = [];
+let lastSource = null;
 
-// ---------- settings (stored only in this browser) ----------
+// ---------- settings of the source block (stored only in this browser) ----------
 function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem('hookmixer') || '{}');
@@ -30,6 +34,7 @@ function saveSettings() {
 FIELDS.forEach((f) => $('#' + f).addEventListener('change', saveSettings));
 loadSettings();
 if (!$('#mainFolder').value.trim()) $('#mainFolder').value = DEFAULT_MAIN_FOLDER;
+mountSettings($('#settings'));
 
 // ---------- UI helpers ----------
 function status(msg, isErr = false) {
@@ -43,15 +48,19 @@ function progress(p) {
 }
 function log(line) {
   logLines.push(line);
-  if (logLines.length > 400) logLines = logLines.slice(-400);
-  $('#log').textContent = logLines.join('\n');
-}
-function updatePoolInfo() {
-  const manual = manualHooks().length;
-  $('#pool').textContent =
-    `Відео-хуків: ${pool.clips.length} · Текстових хуків: ${pool.texts.length + manual} · Основних відео: ${pool.videos.length}`;
+  if (logLines.length > 600) logLines = logLines.slice(-600);
+  $('#log').textContent = logLines.slice(-300).join('\n');
 }
 const manualHooks = () => $('#manualHooks').value.split('\n').map((s) => s.trim()).filter(Boolean);
+function updatePoolInfo() {
+  const extra = [];
+  if (pool.music.length || local.music) extra.push(`Музика: ${local.music ? local.music.name : pool.music.length + ' трек(и)'}`);
+  if (pool.srts.size) extra.push(`Субтитри: ${pool.srts.size}`);
+  if (pool.logos.length || local.logo) extra.push('Логотип: є');
+  $('#pool').textContent =
+    `Відео-хуків: ${pool.clips.length} · Текстових хуків: ${pool.texts.length + manualHooks().length} · Основних відео: ${pool.videos.length}` +
+    (extra.length ? ' · ' + extra.join(' · ') : '');
+}
 $('#manualHooks').addEventListener('input', updatePoolInfo);
 
 document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => {
@@ -59,33 +68,46 @@ document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () 
   mode = t.dataset.mode;
   $('#drive-box').hidden = mode !== 'drive';
   $('#local-box').hidden = mode !== 'local';
-  pool.clips = []; pool.texts = []; pool.videos = [];
+  Object.assign(pool, { clips: [], texts: [], videos: [], music: [], logos: [], srts: new Map() });
   if (mode === 'local') readLocal();
   updatePoolInfo();
 }));
 
-// ---------- Google Drive ----------
+// files chosen inside the settings panel (it re-renders, so listen on the document)
+document.addEventListener('change', (e) => {
+  if (e.target.id === 'localMusic') { local.music = e.target.files[0] || null; updatePoolInfo(); }
+  if (e.target.id === 'localLogo') { local.logo = e.target.files[0] || null; updatePoolInfo(); }
+});
+
+// ---------- file types ----------
+const isVideo = (f) => (f.mimeType || '').startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv)$/i.test(f.name);
+const isImage = (f) => (f.mimeType || '').startsWith('image/') || /\.(jpe?g|png|webp)$/i.test(f.name);
+const isAudio = (f) => (f.mimeType || '').startsWith('audio/') || /\.(mp3|m4a|wav|aac|ogg)$/i.test(f.name);
+const isSrt = (f) => /\.srt$/i.test(f.name);
+const isText = (f) => !isSrt(f) && (f.mimeType === 'text/plain' || /\.txt$/i.test(f.name) || f.mimeType === 'application/vnd.google-apps.document');
+const baseName = (n) => n.replace(/\.[^.]+$/, '').toLowerCase();
+const textLines = (bytes) => new TextDecoder().decode(bytes).split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+
+// ---------- Google Drive (Apps Script or API key) ----------
 function folderId(v) {
   v = v.trim();
   const m = v.match(/folders\/([\w-]+)/) || v.match(/[?&]id=([\w-]+)/);
   return m ? m[1] : v;
 }
-const FOLDER = 'application/vnd.google-apps.folder';
-// "key" is either a Google API key or a link to the Apps Script web app
 const isScript = (key) => /^https:\/\/script\.google(usercontent)?\.com\//.test(key);
 async function scriptCall(url, params) {
   let r;
   try {
     r = await fetch(url + (url.includes('?') ? '&' : '?') + new URLSearchParams(params));
   } catch (e) {
-    throw new Error('Не вдалося звʼязатися зі скриптом. Перевір посилання і що доступ у Web app = «Anyone».');
+    throw new Error('Не вдалося звʼязатися зі скриптом. Перевір посилання і що доступ у Web app = «Усі» (Anyone).');
   }
-  if (!r.ok) throw new Error(`Скрипт відповів ${r.status}. Перевір, що Web app опублікований з доступом «Anyone».`);
+  if (!r.ok) throw new Error(`Скрипт відповів ${r.status}. Перевір, що вебдодаток опублікований з доступом «Усі».`);
   const j = await r.json();
   if (j.error) throw new Error('Помилка скрипта: ' + j.error);
   return j;
 }
-
+const FOLDER = 'application/vnd.google-apps.folder';
 async function driveChildren(id, key) {
   if (isScript(key)) return (await scriptCall(key, { action: 'list', id })).files || [];
   let files = [];
@@ -102,13 +124,10 @@ async function driveChildren(id, key) {
   } while (pageToken);
   return files;
 }
-// all files inside a folder, also one-two levels of subfolders
 async function driveList(id, key, depth = 0) {
   const out = [];
   for (const f of await driveChildren(id, key)) {
-    if (f.mimeType === FOLDER) {
-      if (depth < 2) out.push(...await driveList(f.id, key, depth + 1));
-    } else out.push(f);
+    if (f.mimeType === FOLDER) { if (depth < 2) out.push(...await driveList(f.id, key, depth + 1)); } else out.push(f);
   }
   return out;
 }
@@ -121,12 +140,7 @@ async function driveError(r) {
 }
 async function driveBytes(file, key) {
   if (isScript(key)) {
-    const decode = (b64) => {
-      const bin = atob(b64);
-      const a = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
-      return a;
-    };
+    const decode = (b64) => { const bin = atob(b64); const a = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return a; };
     const first = await scriptCall(key, { action: 'file', id: file.id, start: 0 });
     if (first.text !== undefined) return new TextEncoder().encode(first.text);
     const head = decode(first.base64);
@@ -159,35 +173,36 @@ async function driveBytes(file, key) {
   if (!r.ok) throw new Error(await driveError(r));
   return new Uint8Array(await r.arrayBuffer());
 }
-const isVideo = (f) => (f.mimeType || '').startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv)$/i.test(f.name);
-const isText = (f) => f.mimeType === 'text/plain' || /\.txt$/i.test(f.name) || f.mimeType === 'application/vnd.google-apps.document';
-const textLines = (bytes) => new TextDecoder().decode(bytes).split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-
-const HOOK_RE = /хук|hook/i;
-const VIDEO_RE = /відео|видео|video|ролик|clip|main/i;
+function cached(id, loader) {
+  if (!cache.has(id)) cache.set(id, loader().catch((e) => { cache.delete(id); throw e; }));
+  return cache.get(id);
+}
 const driveItem = (f, key) => ({ name: f.name, get: () => cached(f.id, () => driveBytes(f, key)) });
 
-// fill pools from the selected hooks folder and videos folder
-async function loadPools(key, hooksId, videosId) {
+const RE = {
+  hooks: /хук|hook/i,
+  music: /music|музик|audio|аудіо|sound|звук|трек/i,
+  logo: /logo|лого|brand|бренд/i,
+  videos: /відео|видео|video|body|основ|ролик|clip|main/i,
+};
+
+async function loadPools(key, hooksId, videosId, musicId) {
   status('Читаю файли на Google Drive…');
-  const [hookFiles, videoFiles] = await Promise.all([driveList(hooksId, key), driveList(videosId, key)]);
-  pool.clips = hookFiles.filter(isVideo).map((f) => driveItem(f, key));
+  const [hookFiles, videoFiles, musicFiles] = await Promise.all([
+    driveList(hooksId, key), driveList(videosId, key), musicId ? driveList(musicId, key) : Promise.resolve([])]);
+  pool.clips = hookFiles.filter((f) => isVideo(f) || isImage(f)).map((f) => driveItem(f, key));
   pool.texts = [];
   for (const f of hookFiles.filter(isText)) pool.texts.push(...textLines(await driveBytes(f, key)));
   pool.videos = videoFiles.filter(isVideo).map((f) => driveItem(f, key));
-}
-
-// no subfolders: hooks = files with "hook/хук" in the name + text files, videos = the rest
-function loadFlat(files, key) {
-  pool.clips = files.filter((f) => isVideo(f) && HOOK_RE.test(f.name)).map((f) => driveItem(f, key));
-  pool.videos = files.filter((f) => isVideo(f) && !HOOK_RE.test(f.name)).map((f) => driveItem(f, key));
+  pool.srts = new Map(videoFiles.filter(isSrt).map((f) => [baseName(f.name), driveItem(f, key)]));
+  pool.music = musicFiles.filter(isAudio).map((f) => driveItem(f, key));
 }
 
 function finishLoad() {
   updatePoolInfo();
   if (!pool.videos.length) status('У папці з відео не знайдено відеофайлів. Перевір вибір папок.', true);
   else if (!pool.clips.length && !pool.texts.length && !manualHooks().length) status('Відео знайдено, але хуків немає. Перевір папку з хуками або впиши хуки вручну.', true);
-  else status('Готово. Тисни «Поєднати».');
+  else status('Готово. Налаштуй стиль і тисни «Поєднати».');
 }
 
 $('#loadDrive').addEventListener('click', async () => {
@@ -202,47 +217,54 @@ $('#loadDrive').addEventListener('click', async () => {
     const children = await driveChildren(mainId, key);
     const subs = children.filter((f) => f.mimeType === FOLDER);
     const files = children.filter((f) => f.mimeType !== FOLDER);
+    pool.logos = [];
     if (!subs.length) {
       $('#pickers').hidden = true;
-      loadFlat(files, key);
+      pool.clips = files.filter((f) => (isVideo(f) || isImage(f)) && RE.hooks.test(f.name)).map((f) => driveItem(f, key));
+      pool.videos = files.filter((f) => isVideo(f) && !RE.hooks.test(f.name)).map((f) => driveItem(f, key));
+      pool.music = files.filter(isAudio).map((f) => driveItem(f, key));
+      pool.srts = new Map(files.filter(isSrt).map((f) => [baseName(f.name), driveItem(f, key)]));
       pool.texts = [];
       for (const f of files.filter(isText)) pool.texts.push(...textLines(await driveBytes(f, key)));
       return finishLoad();
     }
-    // subfolders: guess which one is hooks and which is videos by name
-    let hooks = subs.find((f) => HOOK_RE.test(f.name));
-    let videos = subs.find((f) => f !== hooks && VIDEO_RE.test(f.name)) || subs.find((f) => f !== hooks);
-    if (!hooks) hooks = subs.find((f) => f !== videos) || subs[0];
+    // subfolders: guess roles by name, the user can change them in the lists
+    const used = new Set();
+    const pick = (re) => { const f = subs.find((s) => !used.has(s) && re.test(s.name)); if (f) used.add(f); return f; };
+    const hooks = pick(RE.hooks);
+    const music = pick(RE.music);
+    const logo = pick(RE.logo);
+    const videos = pick(RE.videos) || subs.find((s) => !used.has(s));
     const opts = subs.map((f) => `<option value="${f.id}">${f.name.replace(/</g, '&lt;')}</option>`).join('');
     $('#hooksPick').innerHTML = opts;
     $('#videosPick').innerHTML = opts;
-    $('#hooksPick').value = hooks.id;
-    $('#videosPick').value = videos ? videos.id : subs[0].id;
+    $('#musicPick').innerHTML = '<option value="">— немає —</option>' + opts;
+    $('#hooksPick').value = (hooks || subs.find((s) => s !== videos) || subs[0]).id;
+    $('#videosPick').value = (videos || subs[0]).id;
+    $('#musicPick').value = music ? music.id : '';
     $('#pickers').hidden = false;
-    await loadPools(key, $('#hooksPick').value, $('#videosPick').value);
+    if (logo) pool.logos = (await driveList(logo.id, key)).filter(isImage).map((f) => driveItem(f, key));
+    await loadPools(key, $('#hooksPick').value, $('#videosPick').value, $('#musicPick').value);
     finishLoad();
   } catch (e) {
     status(e.message, true);
   } finally { btn.disabled = false; }
 });
 
-['#hooksPick', '#videosPick'].forEach((s) => $(s).addEventListener('change', async () => {
+['#hooksPick', '#videosPick', '#musicPick'].forEach((s) => $(s).addEventListener('change', async () => {
   try {
-    await loadPools($('#apiKey').value.trim(), $('#hooksPick').value, $('#videosPick').value);
+    await loadPools($('#apiKey').value.trim(), $('#hooksPick').value, $('#videosPick').value, $('#musicPick').value);
     finishLoad();
   } catch (e) { status(e.message, true); }
 }));
-
-function cached(id, loader) {
-  if (!cache.has(id)) cache.set(id, loader().catch((e) => { cache.delete(id); throw e; }));
-  return cache.get(id);
-}
 
 // ---------- local files ----------
 function readLocal() {
   const wrap = (f) => ({ name: f.name, get: () => cached('local:' + f.name + f.size, async () => new Uint8Array(await f.arrayBuffer())) });
   pool.clips = [...$('#localHookClips').files].map(wrap);
-  pool.videos = [...$('#localVideos').files].map(wrap);
+  const vids = [...$('#localVideos').files];
+  pool.videos = vids.filter((f) => !isSrt(f)).map(wrap);
+  pool.srts = new Map(vids.filter(isSrt).map((f) => [baseName(f.name), wrap(f)]));
   pool.texts = [];
   updatePoolInfo();
 }
@@ -258,63 +280,8 @@ async function getFFmpeg() {
   ff.on('progress', ({ progress: p }) => progress(p));
   const base = new URL('./vendor/core/', import.meta.url).href;
   await ff.load({ coreURL: base + 'ffmpeg-core.js', wasmURL: base + 'ffmpeg-core.wasm' });
-  const font = await (await fetch(new URL('./fonts/DejaVuSans-Bold.ttf', import.meta.url))).arrayBuffer();
-  await ff.writeFile('font.ttf', new Uint8Array(font));
   ffmpeg = ff;
   return ff;
-}
-
-async function probe(ff, file) {
-  const start = logLines.length;
-  await ff.exec(['-hide_banner', '-i', file]);
-  const text = logLines.slice(start).join('\n');
-  const d = text.match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
-  return {
-    hasAudio: /Stream #.*Audio:/.test(text),
-    duration: d ? (+d[1]) * 3600 + (+d[2]) * 60 + parseFloat(d[3]) : 0,
-  };
-}
-
-function wrapText(text, maxChars) {
-  const words = text.split(/\s+/);
-  const lines = [];
-  let cur = '';
-  for (const w of words) {
-    if ((cur + ' ' + w).trim().length > maxChars && cur) { lines.push(cur); cur = w; } else cur = (cur + ' ' + w).trim();
-  }
-  if (cur) lines.push(cur);
-  return lines;
-}
-
-// render one source into a normalized segment (same size/fps/codecs so they can be glued)
-async function renderSegment(ff, { input, output, W, H, maxSec, hookText, textSeconds }) {
-  const info = await probe(ff, input);
-  let dur = info.duration || 5;
-  if (maxSec > 0) dur = Math.min(dur, maxSec);
-
-  let vf = `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=30,format=yuv420p`;
-  if (hookText) {
-    const fs = Math.round(W * 0.066);
-    const lines = wrapText(hookText, W >= 1000 ? 20 : 20);
-    for (let i = 0; i < lines.length; i++) {
-      await ff.writeFile(`line${i}.txt`, lines[i]);
-      const y = Math.round(H * 0.16 + i * fs * 1.45);
-      const enable = textSeconds ? `:enable='between(t,0,${textSeconds})'` : '';
-      vf += `,drawtext=fontfile=font.ttf:textfile=line${i}.txt:fontsize=${fs}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=${Math.round(fs * 0.3)}:x=(w-text_w)/2:y=${y}${enable}`;
-    }
-  }
-  const args = ['-hide_banner', '-y', '-i', input];
-  let filter;
-  if (info.hasAudio) {
-    filter = `[0:v]${vf}[v];[0:a]aresample=44100,aformat=channel_layouts=stereo[a]`;
-  } else {
-    filter = `[0:v]${vf}[v];anullsrc=r=44100:cl=stereo,atrim=duration=${dur.toFixed(3)}[a]`;
-  }
-  args.push('-filter_complex', filter, '-map', '[v]', '-map', '[a]', '-t', dur.toFixed(3),
-    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '24', '-r', '30',
-    '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2', output);
-  const code = await ff.exec(args);
-  if (code !== 0) throw new Error(`ffmpeg не зміг обробити «${input}». Подивись журнал унизу.`);
 }
 
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
@@ -333,73 +300,78 @@ function chooseHook(hookMode) {
   const clips = pool.clips;
   let m = hookMode;
   if (m === 'auto') {
-    const opts = [];
-    if (clips.length) opts.push('clip');
-    if (texts.length) opts.push('text');
-    if (!opts.length) throw new Error('Немає жодного хука: додай відео-хуки або текстові хуки.');
-    // pick proportionally to how many hooks of each kind exist
+    if (!clips.length && !texts.length) throw new Error('Немає жодного хука: додай відео-хуки або текстові хуки.');
     m = Math.random() < clips.length / (clips.length + texts.length) ? 'clip' : 'text';
   }
   if ((m === 'clip' || m === 'both') && !clips.length) throw new Error('Немає відео-хуків у папці.');
   if ((m === 'text' || m === 'both') && !texts.length) throw new Error('Немає текстових хуків (додай .txt / Google Doc у папку або впиши вручну).');
-  return {
-    mode: m,
-    clip: m === 'clip' || m === 'both' ? pick(clips) : null,
-    text: m === 'text' || m === 'both' ? pick(texts) : null,
-  };
+  return { mode: m, clip: m === 'clip' || m === 'both' ? pick(clips) : null, text: m === 'text' || m === 'both' ? pick(texts) : null };
 }
 
+const extOf = (name, fallback) => (name.match(/\.\w+$/) || [fallback])[0].toLowerCase();
+
 async function makeOne(ff, n, total) {
+  const cfg = getCfg();
   const count = Math.max(1, +$('#count').value || 1);
-  const W = $('#quality').value === '1080' ? 1080 : 720;
-  const H = W === 1080 ? 1920 : 1280;
   const maxSec = Math.max(0, +$('#maxSec').value || 0);
+  const hookSec = Math.max(0, +$('#hookSec').value || 0);
   const hook = chooseHook($('#hookMode').value);
   const videos = pickMany(pool.videos, count);
+  const textSec = +cfg.text.seconds || 3;
 
   const jobs = [];
-  const hookSec = Math.max(0, +$('#hookSec').value || 0);
-  if (hook.clip) jobs.push({ src: hook.clip, hookText: hook.mode === 'both' ? hook.text : null, textSeconds: 0, maxSec: hookSec });
+  if (hook.clip) jobs.push({ src: hook.clip, isHook: true, maxSec: hookSec, text: hook.mode === 'both' ? { content: hook.text, t0: 0, t1: 999 } : null });
   videos.forEach((v, i) => jobs.push({
-    src: v,
-    hookText: hook.mode === 'text' && i === 0 ? hook.text : null,
-    textSeconds: 3,
-    maxSec,
+    src: v, isHook: !hook.clip && i === 0, maxSec,
+    text: hook.mode === 'text' && i === 0 ? { content: hook.text, t0: 0, t1: textSec } : null,
   }));
 
+  await loadFont(ff, cfg);
   const segs = [];
   for (let i = 0; i < jobs.length; i++) {
     const j = jobs[i];
     const label = `Ролик ${n}/${total} · крок ${i + 1}/${jobs.length + 1}`;
     status(`${label}: завантажую «${j.src.name}»…`);
     const bytes = await j.src.get();
-    const input = `in${i}` + (j.src.name.match(/\.\w+$/) || ['.mp4'])[0];
+    const input = `in${i}${extOf(j.src.name, '.mp4')}`;
     await ff.writeFile(input, bytes.slice()); // copy: ffmpeg takes ownership of the buffer, the cache keeps the original
-    status(`${label}: обробляю «${j.src.name}»…`);
-    const output = `seg${i}.mp4`;
-    await renderSegment(ff, { input, output, W, H, maxSec: j.maxSec, hookText: j.hookText, textSeconds: j.textSeconds });
+    if (!j.isHook || !hook.clip) lastSource = { name: j.src.name, bytes }; // background for the style preview
+    let srt = null;
+    const srtItem = cfg.subs.enabled && pool.srts.get(baseName(j.src.name));
+    if (srtItem) { srt = `sub${i}.srt`; await ff.writeFile(srt, (await srtItem.get()).slice()); }
+    status(`${label}: монтую «${j.src.name}»…`);
+    segs.push(await renderSegment(ff, logLines, cfg, { input, name: j.src.name, maxSec: j.maxSec, isHook: j.isHook, text: j.text, srt }, `seg${i}.mp4`));
     await ff.deleteFile(input);
-    segs.push(output);
+    if (srt) await ff.deleteFile(srt);
   }
 
-  status(`Ролик ${n}/${total}: склеюю…`);
-  await ff.writeFile('list.txt', segs.map((s) => `file '${s}'`).join('\n'));
+  status(`Ролик ${n}/${total}: збираю фінальне відео (переходи, звук, ефекти)…`);
+  const extras = { music: null, logo: null };
+  if (cfg.audio.music && (local.music || pool.music.length)) {
+    const m = local.music ? { name: local.music.name, get: async () => new Uint8Array(await local.music.arrayBuffer()) } : pick(pool.music);
+    extras.music = 'music' + extOf(m.name, '.mp3');
+    extras.musicName = m.name;
+    await ff.writeFile(extras.music, (await m.get()).slice());
+  }
+  if (cfg.logo.enabled && (local.logo || pool.logos.length)) {
+    const l = local.logo ? { name: local.logo.name, get: async () => new Uint8Array(await local.logo.arrayBuffer()) } : pool.logos[0];
+    extras.logo = 'logo' + extOf(l.name, '.png');
+    await ff.writeFile(extras.logo, (await l.get()).slice());
+  }
   const out = `mix${n}.mp4`;
-  const code = await ff.exec(['-hide_banner', '-y', '-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', '-movflags', '+faststart', out]);
-  if (code !== 0) throw new Error('Не вдалося склеїти відео. Подивись журнал унизу.');
+  await assemble(ff, logLines, cfg, segs, extras, out);
   const data = await ff.readFile(out);
-  for (const s of segs) await ff.deleteFile(s);
+  for (const s of segs) await ff.deleteFile(s.output);
   await ff.deleteFile(out);
-
-  return { blob: new Blob([data.buffer], { type: 'video/mp4' }), hook, videos };
+  return { blob: new Blob([data.buffer], { type: 'video/mp4' }), hook, videos, music: extras.musicName };
 }
 
-function showResult({ blob, hook, videos }) {
+function showResult({ blob, hook, videos, music }) {
   const url = URL.createObjectURL(blob);
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
   const el = document.createElement('div');
   el.className = 'card result';
-  const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   el.innerHTML = `
     <video src="${url}" controls playsinline></video>
     <div>
@@ -408,6 +380,7 @@ function showResult({ blob, hook, videos }) {
         ${hook.clip ? `<li>Відео-хук: ${esc(hook.clip.name)}</li>` : ''}
         ${hook.text ? `<li>Текстовий хук: «${esc(hook.text)}»</li>` : ''}
         ${videos.map((v) => `<li>Відео: ${esc(v.name)}</li>`).join('')}
+        ${music ? `<li>Музика: ${esc(music)}</li>` : ''}
       </ul>
       <a class="btn" href="${url}" download="junction_mix_${stamp}.mp4">Завантажити MP4</a>
     </div>`;
@@ -437,6 +410,33 @@ $('#mix').addEventListener('click', async () => {
     btn.disabled = false;
     progress(null);
   }
+});
+
+$('#previewBtn').addEventListener('click', async () => {
+  const btn = $('#previewBtn');
+  btn.disabled = true;
+  try {
+    const ff = await getFFmpeg();
+    status('Роблю превʼю…');
+    const sample = manualHooks()[0] || pool.texts[0] || 'Ти досі не можеш говорити англійською?';
+    // use a video that is already downloaded, otherwise a neutral background
+    let sourceFile = null;
+    let sourceName = null;
+    const src = lastSource || (mode === 'local' && pool.videos[0] ? { name: pool.videos[0].name, bytes: await pool.videos[0].get() } : null);
+    if (src) {
+      sourceName = src.name;
+      sourceFile = 'prev' + extOf(sourceName, '.mp4');
+      await ff.writeFile(sourceFile, src.bytes.slice());
+    }
+    const blob = await previewFrame(ff, logLines, getCfg(), { sample, sourceFile, sourceName });
+    if (sourceFile) await ff.deleteFile(sourceFile);
+    const img = $('#previewImg');
+    img.src = URL.createObjectURL(blob);
+    img.hidden = false;
+    status('Превʼю готове.');
+  } catch (e) {
+    status(e.message || String(e), true);
+  } finally { btn.disabled = false; progress(null); }
 });
 
 updatePoolInfo();

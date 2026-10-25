@@ -1,0 +1,3 @@
+Шрифти в цій папці — Google Fonts за ліцензією SIL Open Font License 1.1 (https://openfontlicense.org):
+Montserrat, Unbounded, Rubik, Oswald, Russo One, Manrope, Exo 2, Comfortaa, Caveat, Lobster, Press Start 2P.
+Файли зменшені до латиниці й кирилиці та перейменовані з префіксом "HM", як дозволяє ліцензія.

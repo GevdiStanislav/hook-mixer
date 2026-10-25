@@ -10,10 +10,11 @@
   <main>
     <header>
       <h1>Hook <span>Mixer</span></h1>
-      <p class="muted">Бере випадкове відео й випадковий хук із Google Drive і поєднує їх через ffmpeg прямо у браузері.</p>
+      <p class="muted">Бере випадкове відео й випадковий хук із Google Drive і монтує ролик через ffmpeg прямо у браузері.</p>
     </header>
 
     <section class="card">
+      <h2>1. Джерело</h2>
       <div class="tabs" role="tablist">
         <button class="tab active" data-mode="drive" type="button">Google Drive</button>
         <button class="tab" data-mode="local" type="button">Файли з компʼютера</button>
@@ -34,15 +35,18 @@
           <label>Папка з відео
             <select id="videosPick"></select>
           </label>
+          <label>Папка з музикою
+            <select id="musicPick"></select>
+          </label>
         </div>
       </div>
 
       <div id="local-box" hidden>
-        <label>Відео-хуки (кліпи)
-          <input id="localHookClips" type="file" accept="video/*" multiple>
+        <label>Відео-хуки (кліпи або фото)
+          <input id="localHookClips" type="file" accept="video/*,image/*" multiple>
         </label>
-        <label>Основні відео
-          <input id="localVideos" type="file" accept="video/*" multiple>
+        <label>Основні відео (можна разом із .srt субтитрами)
+          <input id="localVideos" type="file" accept="video/*,.srt" multiple>
         </label>
       </div>
 
@@ -54,6 +58,17 @@
     </section>
 
     <section class="card">
+      <h2>2. Стиль монтажу</h2>
+      <div id="settings"></div>
+      <div class="preview-row">
+        <button id="previewBtn" class="btn ghost" type="button">Показати превʼю кадру</button>
+        <span class="muted small">Як виглядатимуть шрифт, колір, текст, CTA й кольорокорекція.</span>
+      </div>
+      <img id="previewImg" alt="Превʼю кадру" hidden>
+    </section>
+
+    <section class="card">
+      <h2>3. Поєднати</h2>
       <div class="row">
         <label>Відео в одному ролику
           <input id="count" type="number" min="1" max="10" value="1">
@@ -67,12 +82,6 @@
             <option value="clip">Тільки відео-хук</option>
             <option value="text">Тільки текстовий хук</option>
             <option value="both">Відео-хук + текст на ньому</option>
-          </select>
-        </label>
-        <label>Якість
-          <select id="quality">
-            <option value="720">720×1280 (швидко)</option>
-            <option value="1080">1080×1920 (повільніше)</option>
           </select>
         </label>
         <label>Макс. секунд хука
