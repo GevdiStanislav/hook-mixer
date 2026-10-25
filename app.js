@@ -2,7 +2,9 @@ import { FFmpeg } from './vendor/ffmpeg/index.js';
 
 const $ = (s) => document.querySelector(s);
 const DRIVE = 'https://www.googleapis.com/drive/v3/files';
-const FIELDS = ['apiKey', 'hooksFolder', 'videosFolder', 'manualHooks', 'count', 'batch', 'hookMode', 'quality', 'maxSec'];
+const FIELDS = ['apiKey', 'mainFolder', 'manualHooks', 'count', 'batch', 'hookMode', 'quality', 'maxSec'];
+// головна папка Junction на Google Drive (можна змінити на сайті)
+const DEFAULT_MAIN_FOLDER = 'https://drive.google.com/drive/folders/1yoCiuF8Mm6rOSPf482WToMDBtfQIludH';
 
 let mode = 'drive';
 // pool: hook clips, text hooks from files, main videos
@@ -27,6 +29,7 @@ function saveSettings() {
 }
 FIELDS.forEach((f) => $('#' + f).addEventListener('change', saveSettings));
 loadSettings();
+if (!$('#mainFolder').value.trim()) $('#mainFolder').value = DEFAULT_MAIN_FOLDER;
 
 // ---------- UI helpers ----------
 function status(msg, isErr = false) {
@@ -67,7 +70,8 @@ function folderId(v) {
   const m = v.match(/folders\/([\w-]+)/) || v.match(/[?&]id=([\w-]+)/);
   return m ? m[1] : v;
 }
-async function driveList(id, key, depth = 0) {
+const FOLDER = 'application/vnd.google-apps.folder';
+async function driveChildren(id, key) {
   let files = [];
   let pageToken = '';
   do {
@@ -80,10 +84,13 @@ async function driveList(id, key, depth = 0) {
     files = files.concat(j.files || []);
     pageToken = j.nextPageToken || '';
   } while (pageToken);
-  // also look one-two levels into subfolders
+  return files;
+}
+// all files inside a folder, also one-two levels of subfolders
+async function driveList(id, key, depth = 0) {
   const out = [];
-  for (const f of files) {
-    if (f.mimeType === 'application/vnd.google-apps.folder') {
+  for (const f of await driveChildren(id, key)) {
+    if (f.mimeType === FOLDER) {
       if (depth < 2) out.push(...await driveList(f.id, key, depth + 1));
     } else out.push(f);
   }
@@ -108,27 +115,75 @@ const isVideo = (f) => (f.mimeType || '').startsWith('video/') || /\.(mp4|mov|m4
 const isText = (f) => f.mimeType === 'text/plain' || /\.txt$/i.test(f.name) || f.mimeType === 'application/vnd.google-apps.document';
 const textLines = (bytes) => new TextDecoder().decode(bytes).split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
 
+const HOOK_RE = /хук|hook/i;
+const VIDEO_RE = /відео|видео|video|ролик|clip|main/i;
+const driveItem = (f, key) => ({ name: f.name, get: () => cached(f.id, () => driveBytes(f, key)) });
+
+// fill pools from the selected hooks folder and videos folder
+async function loadPools(key, hooksId, videosId) {
+  status('Читаю файли на Google Drive…');
+  const [hookFiles, videoFiles] = await Promise.all([driveList(hooksId, key), driveList(videosId, key)]);
+  pool.clips = hookFiles.filter(isVideo).map((f) => driveItem(f, key));
+  pool.texts = [];
+  for (const f of hookFiles.filter(isText)) pool.texts.push(...textLines(await driveBytes(f, key)));
+  pool.videos = videoFiles.filter(isVideo).map((f) => driveItem(f, key));
+}
+
+// no subfolders: hooks = files with "hook/хук" in the name + text files, videos = the rest
+function loadFlat(files, key) {
+  pool.clips = files.filter((f) => isVideo(f) && HOOK_RE.test(f.name)).map((f) => driveItem(f, key));
+  pool.videos = files.filter((f) => isVideo(f) && !HOOK_RE.test(f.name)).map((f) => driveItem(f, key));
+}
+
+function finishLoad() {
+  updatePoolInfo();
+  if (!pool.videos.length) status('У папці з відео не знайдено відеофайлів. Перевір вибір папок.', true);
+  else if (!pool.clips.length && !pool.texts.length && !manualHooks().length) status('Відео знайдено, але хуків немає. Перевір папку з хуками або впиши хуки вручну.', true);
+  else status('Готово. Тисни «Поєднати».');
+}
+
 $('#loadDrive').addEventListener('click', async () => {
   saveSettings();
   const key = $('#apiKey').value.trim();
-  const hooksId = folderId($('#hooksFolder').value);
-  const videosId = folderId($('#videosFolder').value);
-  if (!key || !hooksId || !videosId) return status('Заповни API-ключ і обидві папки.', true);
+  const mainId = folderId($('#mainFolder').value);
+  if (!key || !mainId) return status('Встав API-ключ і посилання на головну папку.', true);
   const btn = $('#loadDrive');
   btn.disabled = true;
   try {
-    status('Читаю папки на Google Drive…');
-    const [hookFiles, videoFiles] = await Promise.all([driveList(hooksId, key), driveList(videosId, key)]);
-    pool.clips = hookFiles.filter(isVideo).map((f) => ({ name: f.name, get: () => cached(f.id, () => driveBytes(f, key)) }));
-    pool.texts = [];
-    for (const f of hookFiles.filter(isText)) pool.texts.push(...textLines(await driveBytes(f, key)));
-    pool.videos = videoFiles.filter(isVideo).map((f) => ({ name: f.name, get: () => cached(f.id, () => driveBytes(f, key)) }));
-    updatePoolInfo();
-    status(pool.videos.length ? 'Готово. Тисни «Поєднати».' : 'У папці з відео не знайдено відеофайлів.', !pool.videos.length);
+    status('Читаю головну папку…');
+    const children = await driveChildren(mainId, key);
+    const subs = children.filter((f) => f.mimeType === FOLDER);
+    const files = children.filter((f) => f.mimeType !== FOLDER);
+    if (!subs.length) {
+      $('#pickers').hidden = true;
+      loadFlat(files, key);
+      pool.texts = [];
+      for (const f of files.filter(isText)) pool.texts.push(...textLines(await driveBytes(f, key)));
+      return finishLoad();
+    }
+    // subfolders: guess which one is hooks and which is videos by name
+    let hooks = subs.find((f) => HOOK_RE.test(f.name));
+    let videos = subs.find((f) => f !== hooks && VIDEO_RE.test(f.name)) || subs.find((f) => f !== hooks);
+    if (!hooks) hooks = subs.find((f) => f !== videos) || subs[0];
+    const opts = subs.map((f) => `<option value="${f.id}">${f.name.replace(/</g, '&lt;')}</option>`).join('');
+    $('#hooksPick').innerHTML = opts;
+    $('#videosPick').innerHTML = opts;
+    $('#hooksPick').value = hooks.id;
+    $('#videosPick').value = videos ? videos.id : subs[0].id;
+    $('#pickers').hidden = false;
+    await loadPools(key, $('#hooksPick').value, $('#videosPick').value);
+    finishLoad();
   } catch (e) {
     status(e.message, true);
   } finally { btn.disabled = false; }
 });
+
+['#hooksPick', '#videosPick'].forEach((s) => $(s).addEventListener('change', async () => {
+  try {
+    await loadPools($('#apiKey').value.trim(), $('#hooksPick').value, $('#videosPick').value);
+    finishLoad();
+  } catch (e) { status(e.message, true); }
+}));
 
 function cached(id, loader) {
   if (!cache.has(id)) cache.set(id, loader().catch((e) => { cache.delete(id); throw e; }));
@@ -270,7 +325,7 @@ async function makeOne(ff, n, total) {
     status(`${label}: завантажую «${j.src.name}»…`);
     const bytes = await j.src.get();
     const input = `in${i}` + (j.src.name.match(/\.\w+$/) || ['.mp4'])[0];
-    await ff.writeFile(input, bytes);
+    await ff.writeFile(input, bytes.slice()); // copy: ffmpeg takes ownership of the buffer, the cache keeps the original
     status(`${label}: обробляю «${j.src.name}»…`);
     const output = `seg${i}.mp4`;
     await renderSegment(ff, { input, output, W, H, maxSec: j.maxSec, hookText: j.hookText, textSeconds: j.textSeconds });

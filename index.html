@@ -23,13 +23,18 @@
         <label>Google API-ключ
           <input id="apiKey" type="password" placeholder="AIza..." autocomplete="off">
         </label>
-        <label>Папка з хуками (посилання або ID)
-          <input id="hooksFolder" placeholder="https://drive.google.com/drive/folders/...">
-        </label>
-        <label>Папка з відео (посилання або ID)
-          <input id="videosFolder" placeholder="https://drive.google.com/drive/folders/...">
+        <label>Головна папка на Google Drive (посилання або ID)
+          <input id="mainFolder" placeholder="https://drive.google.com/drive/folders/...">
         </label>
         <button id="loadDrive" class="btn ghost" type="button">Завантажити список файлів</button>
+        <div id="pickers" class="row" hidden>
+          <label>Папка з хуками
+            <select id="hooksPick"></select>
+          </label>
+          <label>Папка з відео
+            <select id="videosPick"></select>
+          </label>
+        </div>
       </div>
 
       <div id="local-box" hidden>
