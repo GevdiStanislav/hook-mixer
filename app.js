@@ -71,7 +71,23 @@ function folderId(v) {
   return m ? m[1] : v;
 }
 const FOLDER = 'application/vnd.google-apps.folder';
+// "key" is either a Google API key or a link to the Apps Script web app
+const isScript = (key) => /^https:\/\/script\.google(usercontent)?\.com\//.test(key);
+async function scriptCall(url, params) {
+  let r;
+  try {
+    r = await fetch(url + (url.includes('?') ? '&' : '?') + new URLSearchParams(params));
+  } catch (e) {
+    throw new Error('Не вдалося звʼязатися зі скриптом. Перевір посилання і що доступ у Web app = «Anyone».');
+  }
+  if (!r.ok) throw new Error(`Скрипт відповів ${r.status}. Перевір, що Web app опублікований з доступом «Anyone».`);
+  const j = await r.json();
+  if (j.error) throw new Error('Помилка скрипта: ' + j.error);
+  return j;
+}
+
 async function driveChildren(id, key) {
+  if (isScript(key)) return (await scriptCall(key, { action: 'list', id })).files || [];
   let files = [];
   let pageToken = '';
   do {
@@ -104,6 +120,14 @@ async function driveError(r) {
   return msg;
 }
 async function driveBytes(file, key) {
+  if (isScript(key)) {
+    const j = await scriptCall(key, { action: 'file', id: file.id });
+    if (j.text !== undefined) return new TextEncoder().encode(j.text);
+    const bin = atob(j.base64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
   const url = file.mimeType === 'application/vnd.google-apps.document'
     ? `${DRIVE}/${file.id}/export?mimeType=text/plain&key=${key}`
     : `${DRIVE}/${file.id}?alt=media&key=${key}&supportsAllDrives=true`;
@@ -146,7 +170,7 @@ $('#loadDrive').addEventListener('click', async () => {
   saveSettings();
   const key = $('#apiKey').value.trim();
   const mainId = folderId($('#mainFolder').value);
-  if (!key || !mainId) return status('Встав API-ключ і посилання на головну папку.', true);
+  if (!key || !mainId) return status('Встав посилання на Apps Script (або API-ключ) і посилання на головну папку.', true);
   const btn = $('#loadDrive');
   btn.disabled = true;
   try {

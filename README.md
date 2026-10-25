@@ -16,7 +16,22 @@ ffmpeg працює **прямо у браузері** (ffmpeg.wasm), тому �
 - Підпапки теж читаються (до 2 рівнів вкладеності).
 - Обидві папки: Поділитися → «Усі, хто має посилання» → Читач.
 
-## Google API-ключ (один раз, безкоштовно)
+## Підключення Drive через Apps Script (рекомендовано, без карти й ключів)
+1. Відкрий script.google.com → **New project** (Новий проєкт).
+2. Видали весь код у редакторі й встав вміст файлу `apps-script.gs` з цієї папки. Натисни 💾 (Save).
+3. **Deploy → New deployment** → шестерня ⚙️ → **Web app**.
+   - Execute as: **Me**
+   - Who has access: **Anyone**
+   - Натисни **Deploy**.
+4. Google попросить дозвіл: Authorize access → обери свій акаунт → Advanced → Go to project (unsafe) → Allow.
+   («unsafe» тут означає лише, що скрипт не перевіряла Google; це твій власний скрипт.)
+5. Скопіюй **Web app URL** (закінчується на `/exec`) і встав на сайті в перше поле.
+
+Скрипт віддає тільки файли з головної папки Junction, тому решта твого Drive недоступна. Папку не треба робити публічною.
+Обмеження: один файл до ~30 МБ. Якщо відео більші, стисни їх або використовуй вкладку «Файли з компʼютера».
+Якщо зміниш код скрипта: Deploy → Manage deployments → ✏️ → Version: New version → Deploy.
+
+## Альтернатива: Google API-ключ (один раз, безкоштовно, карта не потрібна)
 1. console.cloud.google.com → створи проєкт (наприклад, `hook-mixer`).
 2. APIs & Services → Library → **Google Drive API** → Enable.
 3. APIs & Services → Credentials → Create credentials → **API key**.
