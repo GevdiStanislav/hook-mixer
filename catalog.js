@@ -47,6 +47,32 @@ export const TRANSITIONS = [
   { id: 'hblur', name: 'Розмиття', note: 'Динамічний blur' },
 ];
 
+// решта переходів ffmpeg (xfade) — показуються в розділі «Ще переходи»
+export const MORE_TRANSITIONS = [
+  { id: 'fadefast', name: 'Швидке згасання' }, { id: 'fadeslow', name: 'Повільне згасання' }, { id: 'fadegrays', name: 'Через сірий' },
+  { id: 'dissolve', name: 'Розчинення' }, { id: 'distance', name: 'Відстань' }, { id: 'radial', name: 'Радар' },
+  { id: 'slideright', name: 'Свайп вправо' }, { id: 'slidedown', name: 'Свайп вниз' },
+  { id: 'smoothright', name: 'Плавно вправо' }, { id: 'smoothup', name: 'Плавно вгору' }, { id: 'smoothdown', name: 'Плавно вниз' },
+  { id: 'wipeleft', name: 'Шторка вліво' }, { id: 'wiperight', name: 'Шторка вправо' }, { id: 'wipeup', name: 'Шторка вгору' }, { id: 'wipedown', name: 'Шторка вниз' },
+  { id: 'wipetl', name: 'Шторка ↖' }, { id: 'wipetr', name: 'Шторка ↗' }, { id: 'wipebl', name: 'Шторка ↙' }, { id: 'wipebr', name: 'Шторка ↘' },
+  { id: 'circleclose', name: 'Коло закривається' }, { id: 'circlecrop', name: 'Коло-маска' }, { id: 'rectcrop', name: 'Прямокутник' },
+  { id: 'vertopen', name: 'Двері по вертикалі' }, { id: 'vertclose', name: 'Двері закриваються' }, { id: 'horzopen', name: 'Відкриття по горизонталі' }, { id: 'horzclose', name: 'Закриття по горизонталі' },
+  { id: 'diagtl', name: 'Діагональ ↖' }, { id: 'diagtr', name: 'Діагональ ↗' }, { id: 'diagbl', name: 'Діагональ ↙' }, { id: 'diagbr', name: 'Діагональ ↘' },
+  { id: 'hlslice', name: 'Слайси вліво' }, { id: 'hrslice', name: 'Слайси вправо' }, { id: 'vuslice', name: 'Слайси вгору' }, { id: 'vdslice', name: 'Слайси вниз' },
+  { id: 'squeezeh', name: 'Стиснення ↔' }, { id: 'squeezev', name: 'Стиснення ↕' },
+];
+
+export const VOICE_FX = [
+  { id: 'none', name: 'Як є', note: 'Без обробки' },
+  { id: 'clean', name: 'Чистий голос', note: 'Прибрати гул і шум, вирівняти' },
+  { id: 'phone', name: 'Телефон', note: 'Як дзвінок' },
+  { id: 'echo', name: 'Луна', note: 'Велика зала' },
+  { id: 'deep', name: 'Низький', note: 'Глибший голос' },
+  { id: 'high', name: 'Високий', note: 'Мультяшний' },
+  { id: 'robot', name: 'Робот', note: 'Металевий' },
+  { id: 'chorus', name: 'Хор', note: 'Обʼємний' },
+];
+
 export const COLOR_GRADES = [
   { id: 'none', name: 'Оригінал', note: 'Без змін', vf: '' },
   { id: 'vivid', name: 'Яскравий', note: 'Соковиті кольори', vf: 'eq=saturation=1.35:contrast=1.08' },
@@ -57,6 +83,7 @@ export const COLOR_GRADES = [
   { id: 'vintage', name: 'Вінтаж', note: 'Плівка 90-х', vf: 'curves=preset=vintage,eq=saturation=0.85' },
   { id: 'matte', name: 'Матовий', note: 'Мʼякий, естетика', vf: "curves=all='0/0.08 1/0.92',eq=saturation=0.9" },
   { id: 'bw', name: 'Чорно-білий', note: 'Драма', vf: 'hue=s=0,eq=contrast=1.15' },
+  { id: 'lut', name: 'Мій LUT', note: '.cube з папки «lut» або файл', vf: '' },
 ];
 
 export const SFX = [
@@ -91,8 +118,16 @@ export const DEFAULTS = {
   anim: 'pop',
   subs: { source: 'srt', model: 'base', lang: 'ukrainian', words: 3, highlight: '#FFD60A', position: 'bottom', color: '#FFFFFF', style: 'outline', size: 'm' },
   transition: { type: 'none', duration: 0.4 },
-  fx: { grade: 'none', vignette: false, grain: false, sharpen: false, hookZoom: false, hookShake: false, progress: false, progressColor: '#3DDC97' },
-  audio: { music: true, musicVol: 0.25, origVol: 1, sfxVol: 0.8, sfxTransition: 'whoosh', sfxHook: 'none', sfxText: 'none', loudnorm: false },
+  fx: {
+    grade: 'none', vignette: false, grain: false, sharpen: false, hookZoom: false, hookShake: false, progress: false, progressColor: '#3DDC97',
+    bright: 0, contrast: 1, sat: 1, temp: 6500,
+    kenburns: false, letterbox: false, vhs: false, glitch: false, leaks: false, flicker: false, trails: false, motionblur: false,
+    comic: false, autolight: false, denoise: false, stabilize: false, hold: false, holdColor: '#FF3B5C',
+  },
+  edit: { cutSilence: false, silenceLevel: 'mid', boomerang: false, freeze: false, fadeIn: false, fadeOut: false, mirror: false, rotate: 0 },
+  audio: { music: true, musicVol: 0.25, origVol: 1, sfxVol: 0.8, sfxTransition: 'whoosh', sfxHook: 'none', sfxText: 'none', loudnorm: false, voice: 'none', denoise: false, duck: false, musicFadeIn: true },
+  export: { webm: false, gif: false, cover: false, mp3: false },
+  brand: { enabled: false, handle: '@junction' },
   format: { aspect: '9:16', hd: false, fit: 'crop', speed: 1, compact: false },
   cta: { enabled: false, text: 'Пиши в директ!', seconds: 2.5 },
   logo: { enabled: false, position: 'tr', size: 0.18, opacity: 0.9 },

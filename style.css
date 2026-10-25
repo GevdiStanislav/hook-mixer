@@ -111,3 +111,6 @@ code{background:#0f0a1a;padding:1px 6px;border-radius:6px;font-size:.85em}
 .sw.none{background:#0f0a1a;color:var(--muted);font-size:.85rem;line-height:1}
 .result .dl{display:inline-block;margin:0 0 12px;color:var(--g);font-size:.9rem}
 .swrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+details.more{margin:14px 0;border:1px solid var(--line);border-radius:12px;padding:10px 12px}
+details.more summary{color:var(--text);font-size:.9rem}
+details.more .tiles{margin-top:10px}

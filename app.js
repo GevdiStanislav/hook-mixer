@@ -1,6 +1,6 @@
 import { FFmpeg } from './vendor/ffmpeg/index.js';
 import { mountSettings, getCfg } from './settings.js';
-import { renderSegment, assemble, loadFont, previewFrame, dims } from './render.js';
+import { renderSegment, assemble, loadFont, previewFrame, dims, cutSilence, exportExtras, encodeWebm, resetRenderCache } from './render.js';
 import { transcribe, extractAudio, wordsFromChunks, groupCaptions, buildAss, buildSrt } from './captions.js';
 
 const $ = (s) => document.querySelector(s);
@@ -11,8 +11,8 @@ const DEFAULT_MAIN_FOLDER = 'https://drive.google.com/drive/folders/1yoCiuF8Mm6r
 
 let mode = 'drive';
 // clips = video/photo hooks, texts = text hooks, videos = main videos, srts = subtitles by base name
-const pool = { clips: [], texts: [], videos: [], music: [], logos: [], srts: new Map() };
-const local = { music: null, logo: null };
+const pool = { clips: [], texts: [], videos: [], music: [], logos: [], luts: [], srts: new Map() };
+const local = { music: null, logo: null, lut: null };
 const cache = new Map();
 let ffmpeg = null;
 let logLines = [];
@@ -58,6 +58,7 @@ function updatePoolInfo() {
   if (pool.music.length || local.music) extra.push(`Музика: ${local.music ? local.music.name : pool.music.length + ' трек(и)'}`);
   if (pool.srts.size) extra.push(`Субтитри: ${pool.srts.size}`);
   if (pool.logos.length || local.logo) extra.push('Логотип: є');
+  if (pool.luts.length || local.lut) extra.push('LUT: ' + (local.lut ? local.lut.name : pool.luts[0].name));
   $('#pool').textContent =
     `Відео-хуків: ${pool.clips.length} · Текстових хуків: ${pool.texts.length + manualHooks().length} · Основних відео: ${pool.videos.length}` +
     (extra.length ? ' · ' + extra.join(' · ') : '');
@@ -69,7 +70,7 @@ document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () 
   mode = t.dataset.mode;
   $('#drive-box').hidden = mode !== 'drive';
   $('#local-box').hidden = mode !== 'local';
-  Object.assign(pool, { clips: [], texts: [], videos: [], music: [], logos: [], srts: new Map() });
+  Object.assign(pool, { clips: [], texts: [], videos: [], music: [], logos: [], luts: [], srts: new Map() });
   if (mode === 'local') readLocal();
   updatePoolInfo();
 }));
@@ -78,6 +79,7 @@ document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () 
 document.addEventListener('change', (e) => {
   if (e.target.id === 'localMusic') { local.music = e.target.files[0] || null; updatePoolInfo(); }
   if (e.target.id === 'localLogo') { local.logo = e.target.files[0] || null; updatePoolInfo(); }
+  if (e.target.id === 'localLut') { local.lut = e.target.files[0] || null; updatePoolInfo(); }
 });
 
 // ---------- file types ----------
@@ -184,6 +186,7 @@ const RE = {
   hooks: /хук|hook/i,
   music: /music|музик|audio|аудіо|sound|звук|трек/i,
   logo: /logo|лого|brand|бренд/i,
+  lut: /lut|лут|cube|колір|color/i,
   videos: /відео|видео|video|body|основ|ролик|clip|main/i,
 };
 
@@ -219,6 +222,7 @@ $('#loadDrive').addEventListener('click', async () => {
     const subs = children.filter((f) => f.mimeType === FOLDER);
     const files = children.filter((f) => f.mimeType !== FOLDER);
     pool.logos = [];
+    pool.luts = files.filter((f) => /\.cube$/i.test(f.name)).map((f) => driveItem(f, key));
     if (!subs.length) {
       $('#pickers').hidden = true;
       pool.clips = files.filter((f) => (isVideo(f) || isImage(f)) && RE.hooks.test(f.name)).map((f) => driveItem(f, key));
@@ -235,6 +239,7 @@ $('#loadDrive').addEventListener('click', async () => {
     const hooks = pick(RE.hooks);
     const music = pick(RE.music);
     const logo = pick(RE.logo);
+    const lut = pick(RE.lut);
     const videos = pick(RE.videos) || subs.find((s) => !used.has(s));
     const opts = subs.map((f) => `<option value="${f.id}">${f.name.replace(/</g, '&lt;')}</option>`).join('');
     $('#hooksPick').innerHTML = opts;
@@ -245,6 +250,7 @@ $('#loadDrive').addEventListener('click', async () => {
     $('#musicPick').value = music ? music.id : '';
     $('#pickers').hidden = false;
     if (logo) pool.logos = (await driveList(logo.id, key)).filter(isImage).map((f) => driveItem(f, key));
+    if (lut) pool.luts.push(...(await driveList(lut.id, key)).filter((f) => /\.cube$/i.test(f.name)).map((f) => driveItem(f, key)));
     await loadPools(key, $('#hooksPick').value, $('#videosPick').value, $('#musicPick').value);
     finishLoad();
   } catch (e) {
@@ -323,20 +329,31 @@ async function makeOne(ff, n, total) {
   const jobs = [];
   if (hook.clip) jobs.push({ src: hook.clip, isHook: true, maxSec: hookSec, text: hook.mode === 'both' ? { content: hook.text, t0: 0, t1: 999 } : null });
   videos.forEach((v, i) => jobs.push({
-    src: v, isHook: !hook.clip && i === 0, maxSec,
+    src: v, isHook: !hook.clip && i === 0, isLast: i === videos.length - 1, maxSec,
     text: hook.mode === 'text' && i === 0 ? { content: hook.text, t0: 0, t1: textSec } : null,
   }));
 
   await loadFont(ff, cfg);
   const segs = [];
   const transcripts = [];
+  let lut = null;
+  if (cfg.fx.grade === 'lut') {
+    const l = local.lut ? { name: local.lut.name, get: async () => new Uint8Array(await local.lut.arrayBuffer()) } : pool.luts[0];
+    if (!l) throw new Error('Обрано «Мій LUT», але файл .cube не знайдено: додай його у вкладці «Ефекти» або в підпапку «lut» на Drive.');
+    lut = 'grade.cube';
+    await ff.writeFile(lut, (await l.get()).slice());
+  }
   for (let i = 0; i < jobs.length; i++) {
     const j = jobs[i];
     const label = `Ролик ${n}/${total} · крок ${i + 1}/${jobs.length + 1}`;
     status(`${label}: завантажую «${j.src.name}»…`);
     const bytes = await j.src.get();
-    const input = `in${i}${extOf(j.src.name, '.mp4')}`;
+    let input = `in${i}${extOf(j.src.name, '.mp4')}`;
     await ff.writeFile(input, bytes.slice()); // copy: ffmpeg takes ownership of the buffer, the cache keeps the original
+    if (cfg.edit.cutSilence && !j.isHook && !isImage(j.src)) {
+      status(`${label}: вирізаю паузи в «${j.src.name}»…`);
+      input = await cutSilence(ff, logLines, input, cfg.edit.silenceLevel);
+    }
     if (!j.isHook || !hook.clip) lastSource = { name: j.src.name, bytes }; // background for the style preview
     let srt = null;
     const srtItem = cfg.subs.source !== 'none' && pool.srts.get(baseName(j.src.name));
@@ -350,7 +367,7 @@ async function makeOne(ff, n, total) {
       }
     }
     status(`${label}: монтую «${j.src.name}»…`);
-    segs.push(await renderSegment(ff, logLines, cfg, { input, name: j.src.name, maxSec: j.maxSec, isHook: j.isHook, text: j.text, srt }, `seg${i}.mp4`));
+    segs.push(await renderSegment(ff, logLines, cfg, { input, name: j.src.name, maxSec: j.maxSec, isHook: j.isHook, isLast: j.isLast, text: j.text, srt, lut }, `seg${i}.mp4`));
     await ff.deleteFile(input);
     if (srt) await ff.deleteFile(srt);
   }
@@ -369,11 +386,23 @@ async function makeOne(ff, n, total) {
     await ff.writeFile(extras.logo, (await l.get()).slice());
   }
   const out = `mix${n}.mp4`;
-  await assemble(ff, logLines, cfg, segs, extras, out);
-  const data = await ff.readFile(out);
+  const length = await assemble(ff, logLines, cfg, segs, extras, out);
   for (const s of segs) await ff.deleteFile(s.output);
+  const base = `junction_mix_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}_${n}`;
+  const files = await exportExtras(ff, cfg, out, length, base, (l) => status(`Ролик ${n}/${total}: готую ${l}…`));
+  const data = await ff.readFile(out);
   await ff.deleteFile(out);
-  return { blob: new Blob([data.buffer], { type: 'video/mp4' }), hook, videos, music: extras.musicName, transcripts };
+  if (lut) await ff.deleteFile(lut);
+  if (cfg.export.webm) {
+    // free the browser's memory first: close this ffmpeg, the next roll starts a fresh one
+    status(`Ролик ${n}/${total}: готую WebM…`);
+    ff.terminate();
+    ffmpeg = null;
+    resetRenderCache();
+    const webm = await encodeWebm(data.slice());
+    if (webm) files.push({ label: 'WebM', name: `${base}.webm`, blob: webm });
+  }
+  return { blob: new Blob([data.buffer], { type: 'video/mp4' }), hook, videos, music: extras.musicName, transcripts, files, base };
 }
 
 // speech → words (cached per file, model, language and length)
@@ -396,7 +425,7 @@ async function autoCaptions(ff, input, job, cfg, label) {
   return groupCaptions(words, +cfg.subs.words || 3, Math.max(8, Math.floor((W * 0.86) / (fs * 0.62))));
 }
 
-function showResult({ blob, hook, videos, music, transcripts = [] }) {
+function showResult({ blob, hook, videos, music, transcripts = [], files = [], base }) {
   const url = URL.createObjectURL(blob);
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
   const el = document.createElement('div');
@@ -412,8 +441,9 @@ function showResult({ blob, hook, videos, music, transcripts = [] }) {
         ${videos.map((v) => `<li>Відео: ${esc(v.name)}</li>`).join('')}
         ${music ? `<li>Музика: ${esc(music)}</li>` : ''}
       </ul>
+      ${files.map((f) => `<a class="dl" href="${URL.createObjectURL(f.blob)}" download="${esc(f.name)}">⬇ ${esc(f.label)} · ${(f.blob.size / 1048576).toFixed(1)} МБ</a><br>`).join('')}
       ${transcripts.map((t) => `<a class="dl" href="${URL.createObjectURL(new Blob([t.srt], { type: 'text/plain' }))}" download="${esc(t.name.replace(/\.[^.]+$/, ''))}.srt">⬇ Субтитри ${esc(t.name)} (.srt)</a><br>`).join('')}
-      <a class="btn" href="${url}" download="junction_mix_${stamp}.mp4">Завантажити MP4</a>
+      <a class="btn" href="${url}" download="${base || 'junction_mix_' + stamp}.mp4">Завантажити MP4</a>
     </div>`;
   $('#results').prepend(el);
 }
@@ -428,10 +458,10 @@ $('#mix').addEventListener('click', async () => {
   btn.disabled = true;
   const total = Math.max(1, +$('#batch').value || 1);
   try {
-    const ff = await getFFmpeg();
+    await getFFmpeg();
     for (let n = 1; n <= total; n++) {
       progress(0);
-      showResult(await makeOne(ff, n, total));
+      showResult(await makeOne(await getFFmpeg(), n, total));
     }
     status(total > 1 ? `Готово: ${total} ролики.` : 'Готово!');
   } catch (e) {
@@ -459,7 +489,14 @@ $('#previewBtn').addEventListener('click', async () => {
       sourceFile = 'prev' + extOf(sourceName, '.mp4');
       await ff.writeFile(sourceFile, src.bytes.slice());
     }
-    const blob = await previewFrame(ff, logLines, getCfg(), { sample, sourceFile, sourceName });
+    let lut = null;
+    const cfgNow = getCfg();
+    if (cfgNow.fx.grade === 'lut' && (local.lut || pool.luts[0])) {
+      const l = local.lut ? { get: async () => new Uint8Array(await local.lut.arrayBuffer()) } : pool.luts[0];
+      lut = 'grade.cube';
+      await ff.writeFile(lut, (await l.get()).slice());
+    }
+    const blob = await previewFrame(ff, logLines, cfgNow, { sample, sourceFile, sourceName, lut });
     if (sourceFile) await ff.deleteFile(sourceFile);
     const img = $('#previewImg');
     img.src = URL.createObjectURL(blob);
