@@ -1,0 +1,30 @@
+:root{--bg:#0b0813;--card:#161024;--line:#2a2040;--text:#f3effa;--muted:#b3a9c9;--p1:#4B0082;--p2:#6A1FB0;--g:#3ddc97;--err:#ff6b81}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(900px 500px at 70% -10%,#2a1050 0,transparent 60%),var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,sans-serif;line-height:1.5}
+main{max-width:860px;margin:0 auto;padding:32px 16px 64px}
+h1{font-size:clamp(2rem,6vw,3rem);margin:0 0 6px}
+h1 span{color:var(--g)}
+.muted{color:var(--muted)}
+.small{font-size:.9rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;margin:18px 0}
+label{display:block;margin:12px 0;font-size:.9rem;color:var(--muted)}
+input,select,textarea{display:block;width:100%;margin-top:6px;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:#0f0a1a;color:var(--text);font:inherit}
+input[type=file]{padding:8px}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0 14px}
+.tabs{display:flex;gap:8px;margin-bottom:6px}
+.tab{flex:1;padding:10px;border-radius:10px;border:1px solid var(--line);background:transparent;color:var(--muted);font:inherit;cursor:pointer}
+.tab.active{background:var(--p1);color:#fff;border-color:var(--p2)}
+.btn{display:inline-block;padding:12px 20px;border-radius:12px;border:0;background:linear-gradient(135deg,var(--p1),var(--p2));color:#fff;font:inherit;font-weight:700;cursor:pointer;text-decoration:none}
+.btn:hover{filter:brightness(1.15)}
+.btn:disabled{opacity:.5;cursor:wait}
+.btn.ghost{background:transparent;border:1px solid var(--p2)}
+.btn.big{width:100%;padding:16px;font-size:1.15rem;margin-top:8px}
+.progress{height:8px;background:#0f0a1a;border-radius:99px;overflow:hidden;margin-top:14px}
+#bar{height:100%;width:0;background:var(--g);transition:width .2s}
+.result{display:grid;grid-template-columns:minmax(0,220px) 1fr;gap:16px;align-items:start}
+.result video{width:100%;border-radius:12px;background:#000;aspect-ratio:9/16}
+.result ul{padding-left:18px;margin:6px 0 14px;color:var(--muted);font-size:.9rem;word-break:break-word}
+.err{color:var(--err)}
+pre{white-space:pre-wrap;font-size:.75rem;color:var(--muted);max-height:300px;overflow:auto}
+summary{cursor:pointer;color:var(--muted)}
+@media(max-width:560px){.result{grid-template-columns:1fr}}
