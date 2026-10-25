@@ -2,7 +2,7 @@ import { FFmpeg } from './vendor/ffmpeg/index.js';
 
 const $ = (s) => document.querySelector(s);
 const DRIVE = 'https://www.googleapis.com/drive/v3/files';
-const FIELDS = ['apiKey', 'mainFolder', 'manualHooks', 'count', 'batch', 'hookMode', 'quality', 'maxSec'];
+const FIELDS = ['apiKey', 'mainFolder', 'manualHooks', 'count', 'batch', 'hookMode', 'quality', 'maxSec', 'hookSec'];
 // головна папка Junction на Google Drive (можна змінити на сайті)
 const DEFAULT_MAIN_FOLDER = 'https://drive.google.com/drive/folders/1yoCiuF8Mm6rOSPf482WToMDBtfQIludH';
 
@@ -358,7 +358,8 @@ async function makeOne(ff, n, total) {
   const videos = pickMany(pool.videos, count);
 
   const jobs = [];
-  if (hook.clip) jobs.push({ src: hook.clip, hookText: hook.mode === 'both' ? hook.text : null, textSeconds: 0, maxSec: 0 });
+  const hookSec = Math.max(0, +$('#hookSec').value || 0);
+  if (hook.clip) jobs.push({ src: hook.clip, hookText: hook.mode === 'both' ? hook.text : null, textSeconds: 0, maxSec: hookSec });
   videos.forEach((v, i) => jobs.push({
     src: v,
     hookText: hook.mode === 'text' && i === 0 ? hook.text : null,
