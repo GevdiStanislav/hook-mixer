@@ -121,11 +121,35 @@ async function driveError(r) {
 }
 async function driveBytes(file, key) {
   if (isScript(key)) {
-    const j = await scriptCall(key, { action: 'file', id: file.id });
-    if (j.text !== undefined) return new TextEncoder().encode(j.text);
-    const bin = atob(j.base64);
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    const decode = (b64) => {
+      const bin = atob(b64);
+      const a = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
+      return a;
+    };
+    const first = await scriptCall(key, { action: 'file', id: file.id, start: 0 });
+    if (first.text !== undefined) return new TextEncoder().encode(first.text);
+    const head = decode(first.base64);
+    if (first.size === undefined || head.length >= first.size) return head; // small file or old script version
+    // big file: the script sends it in 8 MB pieces, fetch the rest 3 at a time
+    const size = first.size;
+    const out = new Uint8Array(size);
+    out.set(head, 0);
+    const starts = [];
+    for (let s = head.length; s < size; s += head.length) starts.push(s);
+    let done = head.length;
+    const show = () => status(`Завантажую «${file.name}» з Drive: ${Math.round((done / size) * 100)}% (${(size / 1048576).toFixed(0)} МБ)`);
+    show();
+    const worker = async () => {
+      while (starts.length) {
+        const s = starts.shift();
+        const part = decode((await scriptCall(key, { action: 'file', id: file.id, start: s })).base64);
+        out.set(part, s);
+        done += part.length;
+        show();
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
     return out;
   }
   const url = file.mimeType === 'application/vnd.google-apps.document'

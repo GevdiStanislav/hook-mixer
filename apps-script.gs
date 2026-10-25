@@ -1,8 +1,10 @@
 // Hook Mixer — міст між сайтом і твоєю папкою на Google Drive.
 // Встав цей код на script.google.com і опублікуй як Web app (інструкція в README.md).
 // Скрипт віддає ТІЛЬКИ файли всередині головної папки, решта твого Drive недоступна.
+// Великі відео передаються частинами по 8 МБ, тому розмір файлу не обмежений.
 
 const ROOT_FOLDER_ID = '1yoCiuF8Mm6rOSPf482WToMDBtfQIludH';
+const CHUNK = 8 * 1024 * 1024;
 
 function doGet(e) {
   let out;
@@ -30,10 +32,20 @@ function doGet(e) {
       if (type === MimeType.GOOGLE_DOCS) {
         out = { text: DocumentApp.openById(p.id).getBody().getText() };
       } else {
-        out = { base64: Utilities.base64Encode(f.getBlob().getBytes()), mimeType: type };
+        // віддаємо шматок файлу: байти [start, start + CHUNK)
+        const size = f.getSize();
+        const start = Math.max(0, parseInt(p.start || '0', 10));
+        const end = Math.min(size, start + CHUNK) - 1;
+        const resp = UrlFetchApp.fetch('https://www.googleapis.com/drive/v3/files/' + p.id + '?alt=media&supportsAllDrives=true', {
+          headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken(), Range: 'bytes=' + start + '-' + end },
+          muteHttpExceptions: true,
+        });
+        const code = resp.getResponseCode();
+        if (code !== 200 && code !== 206) throw new Error('Drive повернув ' + code + ': ' + resp.getContentText().slice(0, 200));
+        out = { base64: Utilities.base64Encode(resp.getContent()), mimeType: type, size: size, start: start, end: end };
       }
     } else {
-      out = { ok: true, message: 'Hook Mixer script працює' };
+      out = { ok: true, message: 'Hook Mixer script працює', version: 2 };
     }
   } catch (err) {
     out = { error: String(err && err.message || err) };
@@ -58,4 +70,12 @@ function isInsideRoot(item) {
     level = next;
   }
   return false;
+}
+
+// Запусти цю функцію один раз вручну (кнопка ▶ Run), щоб Google попросив нові дозволи.
+function authorize() {
+  DriveApp.getRootFolder();
+  UrlFetchApp.fetch('https://www.googleapis.com/drive/v3/about?fields=user', {
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+  });
 }
