@@ -7,7 +7,7 @@ const waiting = new Map();
 
 function getWorker() {
   if (worker) return worker;
-  worker = new Worker(new URL('./asr-worker.js', import.meta.url), { type: 'module' });
+  worker = new Worker(new URL('./asr-worker.js?v=20261026b', import.meta.url), { type: 'module' });
   worker.onmessage = ({ data }) => {
     const w = waiting.get(data.id);
     if (!w) return;

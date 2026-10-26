@@ -149,7 +149,7 @@ async function driveBytes(file, key) {
     if (first.text !== undefined) return new TextEncoder().encode(first.text);
     const head = decode(first.base64);
     if (first.size === undefined || head.length >= first.size) return head; // small file or old script version
-    // big file: the script sends it in 8 MB pieces, fetch the rest 3 at a time
+    // big file: the script sends it in 8 MB pieces
     const size = first.size;
     const out = new Uint8Array(size);
     out.set(head, 0);
@@ -167,7 +167,8 @@ async function driveBytes(file, key) {
         show();
       }
     };
-    await Promise.all([worker(), worker(), worker()]);
+    // 6 pieces at a time: Apps Script answers each call slowly, so parallel calls are much faster
+    await Promise.all([worker(), worker(), worker(), worker(), worker(), worker()]);
     return out;
   }
   const url = file.mimeType === 'application/vnd.google-apps.document'
@@ -303,33 +304,48 @@ $('#localVideos').addEventListener('change', readLocal);
 // ---------- ffmpeg ----------
 // Multi-threaded ffmpeg needs a "cross-origin isolated" page (headers in vercel.json); otherwise the single-threaded one is used.
 let MT = typeof SharedArrayBuffer !== 'undefined' && self.crossOriginIsolated === true;
+// version in worker URLs: browsers that cached old copies (sent without the isolation headers) would block them
+const BUILD = '20261026b';
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
 async function loadCore(kind) {
   const ff = new FFmpeg();
   ff.on('log', ({ message }) => log(message));
   ff.on('progress', ({ progress: p }) => progress(p));
   const base = new URL(kind === 'mt' ? './vendor/core-mt/' : './vendor/core/', import.meta.url).href;
-  const opt = { coreURL: base + 'ffmpeg-core.js', wasmURL: base + 'ffmpeg-core.wasm' };
+  const opt = {
+    coreURL: base + 'ffmpeg-core.js', wasmURL: base + 'ffmpeg-core.wasm',
+    classWorkerURL: new URL(`./vendor/ffmpeg/worker.js?v=${BUILD}`, import.meta.url).href,
+  };
   if (kind === 'mt') opt.workerURL = base + 'ffmpeg-core.worker.js';
   try {
-    await ff.load(opt);
+    await withTimeout(ff.load(opt), 120000);
     return ff;
   } catch (e) {
     ff.terminate();
     throw e;
   }
 }
-async function getFFmpeg() {
-  if (ffmpeg) return ffmpeg;
-  status(`Завантажую ffmpeg${MT ? ' (багатопотоковий, швидший)' : ''} (≈30 МБ, тільки перший раз)…`);
-  let ff = null;
-  // multi-threaded first (it has a fixed 1 GB of memory); if the browser refuses it — single-threaded
-  if (MT) { try { ff = await loadCore('mt'); } catch (e) { log(`Багатопотоковий ffmpeg не запустився: ${(e && e.message) || e}`); } }
-  if (!ff) { MT = false; ff = await loadCore('st'); }
-  setThreading(MT);
-  resetRenderCache();
-  ffmpeg = ff;
-  return ff;
+let ffLoading = null;
+function getFFmpeg() {
+  if (ffmpeg) return Promise.resolve(ffmpeg);
+  if (!ffLoading) {
+    ffLoading = (async () => {
+      let ff = null;
+      // multi-threaded first (it has a fixed 1 GB of memory); if the browser refuses it — single-threaded
+      if (MT) { try { ff = await loadCore('mt'); } catch (e) { log(`Багатопотоковий ffmpeg не запустився: ${(e && e.message) || e}`); } }
+      if (!ff) { MT = false; ff = await loadCore('st'); }
+      setThreading(MT);
+      resetRenderCache();
+      ffmpeg = ff;
+      return ff;
+    })().finally(() => { ffLoading = null; });
+  }
+  return ffLoading;
 }
+// start downloading ffmpeg (≈30 МБ) right away, while the settings are being chosen
+setTimeout(() => {
+  getFFmpeg().then(() => { if (!$('#status').textContent) status(`ffmpeg готовий${MT ? ' (багатопотоковий режим)' : ''}.`); }).catch(() => { /* retried on «Поєднати» */ });
+}, 800);
 async function restartFFmpeg() {
   if (ffmpeg) { try { ffmpeg.terminate(); } catch (e) { /* already dead */ } }
   ffmpeg = null;
@@ -600,6 +616,7 @@ $('#mix').addEventListener('click', async () => {
     const total = plans.length;
     prefetch(plans);
     const segCache = total > 1 ? new Map() : null;
+    if (!ffmpeg) status(`Завантажую ffmpeg${MT ? ' (багатопотоковий)' : ''}… Перший раз це до хвилини, далі миттєво.`);
     await getFFmpeg();
     for (let n = 1; n <= total; n++) {
       progress(0);

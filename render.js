@@ -589,7 +589,7 @@ export async function encodeWebm(mp4Bytes) {
   const f2 = new FFmpeg();
   try {
     const core = new URL('./vendor/core/', import.meta.url).href;
-    await f2.load({ coreURL: core + 'ffmpeg-core.js', wasmURL: core + 'ffmpeg-core.wasm' });
+    await f2.load({ coreURL: core + 'ffmpeg-core.js', wasmURL: core + 'ffmpeg-core.wasm', classWorkerURL: new URL('./vendor/ffmpeg/worker.js?v=20261026b', import.meta.url).href });
     await f2.writeFile('in.mp4', mp4Bytes);
     const code = await f2.exec(['-hide_banner', '-y', '-i', 'in.mp4', '-c:v', 'libvpx', '-deadline', 'realtime', '-cpu-used', '8', '-lag-in-frames', '0',
       '-auto-alt-ref', '0', '-threads', '1', '-b:v', '2500k', '-c:a', 'libvorbis', '-b:a', '128k', 'video.webm']);
