@@ -3,7 +3,10 @@ import { pipeline, env } from './vendor/transformers/transformers.min.js';
 
 env.allowLocalModels = false;
 env.backends.onnx.wasm.wasmPaths = new URL('./vendor/transformers/', import.meta.url).href;
-env.backends.onnx.wasm.numThreads = 1;
+// several threads when the page is cross-origin isolated (vercel.json), otherwise one
+env.backends.onnx.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
+// the video card (WebGPU) is many times faster than the processor, when the browser supports it
+const hasGPU = async () => { try { return !!(navigator.gpu && (await navigator.gpu.requestAdapter())); } catch (e) { return false; } };
 
 const MODELS = {
   base: { id: 'onnx-community/whisper-base', dtype: { encoder_model: 'fp32', decoder_model_merged: 'q8' } },
@@ -27,7 +30,11 @@ async function load(model, id) {
     }
   };
   try {
-    asr = await pipeline('automatic-speech-recognition', m.id, { dtype: m.dtype, device: 'wasm', progress_callback });
+    if (await hasGPU()) {
+      asr = await pipeline('automatic-speech-recognition', m.id, { dtype: { encoder_model: 'fp32', decoder_model_merged: 'q4' }, device: 'webgpu', progress_callback });
+    } else {
+      asr = await pipeline('automatic-speech-recognition', m.id, { dtype: m.dtype, device: 'wasm', progress_callback });
+    }
   } catch (e) {
     // some model versions ship only quantized files
     asr = await pipeline('automatic-speech-recognition', m.id, { dtype: 'q8', device: 'wasm', progress_callback });

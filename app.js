@@ -1,11 +1,12 @@
 import { FFmpeg } from './vendor/ffmpeg/index.js';
 import { mountSettings, getCfg } from './settings.js';
-import { renderSegment, assemble, loadFont, previewFrame, dims, cutSilence, exportExtras, encodeWebm, resetRenderCache } from './render.js';
+import { renderSegment, renderAll, assemble, loadFont, previewFrame, dims, cutSilence, exportExtras, encodeWebm, resetRenderCache, setThreading } from './render.js';
+import { makeZip } from './zip.js';
 import { transcribe, extractAudio, wordsFromChunks, groupCaptions, buildAss, buildSrt } from './captions.js';
 
 const $ = (s) => document.querySelector(s);
 const DRIVE = 'https://www.googleapis.com/drive/v3/files';
-const FIELDS = ['apiKey', 'mainFolder', 'manualHooks', 'count', 'batch', 'hookMode', 'maxSec', 'hookSec'];
+const FIELDS = ['apiKey', 'mainFolder', 'manualHooks', 'count', 'batch', 'hookMode', 'maxSec', 'hookSec', 'pickMode'];
 // головна папка Junction на Google Drive (можна змінити на сайті)
 const DEFAULT_MAIN_FOLDER = 'https://drive.google.com/drive/folders/1yoCiuF8Mm6rOSPf482WToMDBtfQIludH';
 
@@ -180,7 +181,26 @@ function cached(id, loader) {
   if (!cache.has(id)) cache.set(id, loader().catch((e) => { cache.delete(id); throw e; }));
   return cache.get(id);
 }
-const driveItem = (f, key) => ({ name: f.name, get: () => cached(f.id, () => driveBytes(f, key)) });
+// Drive files are also kept in the browser's cache, so the next visit doesn't download them again
+const FILE_CACHE = 'hook-mixer-files-v1';
+async function persistentGet(key, loader) {
+  let store = null;
+  try { store = await caches.open(FILE_CACHE); } catch (e) { return loader(); }
+  const url = '/__files/' + encodeURIComponent(key);
+  try {
+    const hit = await store.match(url);
+    if (hit) return new Uint8Array(await hit.arrayBuffer());
+  } catch (e) { /* cache unavailable */ }
+  const bytes = await loader();
+  try { await store.put(url, new Response(bytes.slice())); } catch (e) { /* quota full: just don't cache */ }
+  return bytes;
+}
+const driveItem = (f, key) => ({ name: f.name, get: () => cached(f.id, () => persistentGet(`${f.id}:${f.size || ''}`, () => driveBytes(f, key))) });
+$('#clearCache').addEventListener('click', async () => {
+  try { await caches.delete(FILE_CACHE); } catch (e) { /* ignore */ }
+  cache.clear();
+  status('Кеш файлів очищено: наступного разу файли завантажаться з Drive заново.');
+});
 
 const RE = {
   hooks: /хук|hook/i,
@@ -204,6 +224,7 @@ async function loadPools(key, hooksId, videosId, musicId) {
 
 function finishLoad() {
   updatePoolInfo();
+  updatePlanInfo();
   if (!pool.videos.length) status('У папці з відео не знайдено відеофайлів. Перевір вибір папок.', true);
   else if (!pool.clips.length && !pool.texts.length && !manualHooks().length) status('Відео знайдено, але хуків немає. Перевір папку з хуками або впиши хуки вручну.', true);
   else status('Готово. Налаштуй стиль і тисни «Поєднати».');
@@ -274,27 +295,51 @@ function readLocal() {
   pool.srts = new Map(vids.filter(isSrt).map((f) => [baseName(f.name), wrap(f)]));
   pool.texts = [];
   updatePoolInfo();
+  updatePlanInfo();
 }
 $('#localHookClips').addEventListener('change', readLocal);
 $('#localVideos').addEventListener('change', readLocal);
 
 // ---------- ffmpeg ----------
-async function getFFmpeg() {
-  if (ffmpeg) return ffmpeg;
-  status('Завантажую ffmpeg (≈30 МБ, тільки перший раз)…');
+// Multi-threaded ffmpeg needs a "cross-origin isolated" page (headers in vercel.json); otherwise the single-threaded one is used.
+let MT = typeof SharedArrayBuffer !== 'undefined' && self.crossOriginIsolated === true;
+async function loadCore(kind) {
   const ff = new FFmpeg();
   ff.on('log', ({ message }) => log(message));
   ff.on('progress', ({ progress: p }) => progress(p));
-  const base = new URL('./vendor/core/', import.meta.url).href;
-  await ff.load({ coreURL: base + 'ffmpeg-core.js', wasmURL: base + 'ffmpeg-core.wasm' });
+  const base = new URL(kind === 'mt' ? './vendor/core-mt/' : './vendor/core/', import.meta.url).href;
+  const opt = { coreURL: base + 'ffmpeg-core.js', wasmURL: base + 'ffmpeg-core.wasm' };
+  if (kind === 'mt') opt.workerURL = base + 'ffmpeg-core.worker.js';
+  try {
+    await ff.load(opt);
+    return ff;
+  } catch (e) {
+    ff.terminate();
+    throw e;
+  }
+}
+async function getFFmpeg() {
+  if (ffmpeg) return ffmpeg;
+  status(`Завантажую ffmpeg${MT ? ' (багатопотоковий, швидший)' : ''} (≈30 МБ, тільки перший раз)…`);
+  let ff = null;
+  // multi-threaded first (it has a fixed 1 GB of memory); if the browser refuses it — single-threaded
+  if (MT) { try { ff = await loadCore('mt'); } catch (e) { log(`Багатопотоковий ffmpeg не запустився: ${(e && e.message) || e}`); } }
+  if (!ff) { MT = false; ff = await loadCore('st'); }
+  setThreading(MT);
+  resetRenderCache();
   ffmpeg = ff;
   return ff;
 }
+async function restartFFmpeg() {
+  if (ffmpeg) { try { ffmpeg.terminate(); } catch (e) { /* already dead */ } }
+  ffmpeg = null;
+  return getFFmpeg();
+}
 
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
-function pickMany(arr, n) {
-  const copy = [...arr];
-  const out = [];
+function pickMany(arr, n, first = null) {
+  const copy = arr.filter((x) => x !== first);
+  const out = first ? [first] : [];
   while (out.length < n) {
     if (!copy.length) copy.push(...arr); // not enough files → allow repeats
     out.push(copy.splice(Math.floor(Math.random() * copy.length), 1)[0]);
@@ -302,39 +347,122 @@ function pickMany(arr, n) {
   return out;
 }
 
-function chooseHook(hookMode) {
+// ---------- plans: what goes into each roll ----------
+function hookItems(hookMode) {
   const texts = [...pool.texts, ...manualHooks()];
   const clips = pool.clips;
-  let m = hookMode;
-  if (m === 'auto') {
-    if (!clips.length && !texts.length) throw new Error('Немає жодного хука: додай відео-хуки або текстові хуки.');
-    m = Math.random() < clips.length / (clips.length + texts.length) ? 'clip' : 'text';
+  if (hookMode === 'clip') return clips.map((c) => ({ mode: 'clip', clip: c, text: null }));
+  if (hookMode === 'text') return texts.map((t) => ({ mode: 'text', clip: null, text: t }));
+  if (hookMode === 'both') return texts.length ? clips.map((c) => ({ mode: 'both', clip: c, text: pick(texts) })) : [];
+  return [...clips.map((c) => ({ mode: 'clip', clip: c, text: null })), ...texts.map((t) => ({ mode: 'text', clip: null, text: t }))];
+}
+const MAX_ROLLS = 60;
+/** Returns [{ hook, videos, tag }] — one entry per roll. */
+function buildPlans() {
+  const hookMode = $('#hookMode').value;
+  const count = Math.max(1, +$('#count').value || 1);
+  const how = $('#pickMode').value;
+  const hooks = hookItems(hookMode);
+  if (!hooks.length) {
+    if (hookMode === 'clip' || hookMode === 'both') throw new Error('Немає відео-хуків у папці.');
+    if (hookMode === 'text') throw new Error('Немає текстових хуків (додай .txt / Google Doc у папку або впиши вручну).');
+    throw new Error('Немає жодного хука: додай відео-хуки або текстові хуки.');
   }
-  if ((m === 'clip' || m === 'both') && !clips.length) throw new Error('Немає відео-хуків у папці.');
-  if ((m === 'text' || m === 'both') && !texts.length) throw new Error('Немає текстових хуків (додай .txt / Google Doc у папку або впиши вручну).');
-  return { mode: m, clip: m === 'clip' || m === 'both' ? pick(clips) : null, text: m === 'text' || m === 'both' ? pick(texts) : null };
+  const hIndex = (h) => hooks.indexOf(h) + 1;
+  const bIndex = (v) => pool.videos.indexOf(v) + 1;
+  const pad = (x) => String(x).padStart(2, '0');
+  const plans = [];
+  if (how === 'matrix') {
+    for (const h of hooks) for (const v of pool.videos) plans.push({ hook: h, videos: pickMany(pool.videos, count, v) });
+  } else if (how === 'eachHook') {
+    for (const h of hooks) plans.push({ hook: h, videos: pickMany(pool.videos, count) });
+  } else {
+    const total = Math.max(1, +$('#batch').value || 1);
+    for (let i = 0; i < total; i++) plans.push({ hook: pick(hooks), videos: pickMany(pool.videos, count) });
+  }
+  plans.forEach((p) => { p.tag = `H${pad(hIndex(p.hook))}-B${pad(bIndex(p.videos[0]))}`; });
+  return plans.slice(0, MAX_ROLLS);
 }
 
-const extOf = (name, fallback) => (name.match(/\.\w+$/) || [fallback])[0].toLowerCase();
+function updatePlanInfo() {
+  const el = $('#planInfo');
+  if (!el) return;
+  const how = $('#pickMode').value;
+  $('#batchWrap').hidden = how !== 'random';
+  if (!pool.videos.length) { el.textContent = ''; return; }
+  const n = hookItems($('#hookMode').value).length;
+  const rolls = how === 'matrix' ? n * pool.videos.length : how === 'eachHook' ? n : Math.max(1, +$('#batch').value || 1);
+  el.textContent = `Буде зроблено роликів: ${Math.min(rolls, MAX_ROLLS)}${rolls > MAX_ROLLS ? ` (з ${rolls}, максимум ${MAX_ROLLS} за раз)` : ''}.`;
+}
+['#pickMode', '#hookMode', '#batch'].forEach((s) => $(s).addEventListener('change', updatePlanInfo));
+$('#manualHooks').addEventListener('input', updatePlanInfo);
 
-async function makeOne(ff, n, total) {
-  const cfg = getCfg();
-  const count = Math.max(1, +$('#count').value || 1);
+const extOf = (name, fallback) => (name.match(/\.\w+$/) || [fallback])[0].toLowerCase();
+const slug = (s) => String(s || '').replace(/\.[^.]+$/, '').replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-|-$/g, '').slice(0, 24) || 'x';
+let fileN = 0;
+
+/** Jobs (sources in order) for one plan. */
+function jobsFor(plan, cfg) {
   const maxSec = Math.max(0, +$('#maxSec').value || 0);
   const hookSec = Math.max(0, +$('#hookSec').value || 0);
-  const hook = chooseHook($('#hookMode').value);
-  const videos = pickMany(pool.videos, count);
   const textSec = +cfg.text.seconds || 3;
-
+  const { hook, videos } = plan;
   const jobs = [];
-  if (hook.clip) jobs.push({ src: hook.clip, isHook: true, maxSec: hookSec, text: hook.mode === 'both' ? { content: hook.text, t0: 0, t1: 999 } : null });
+  if (hook.clip) jobs.push({ src: hook.clip, isHook: true, isLast: false, maxSec: hookSec, text: hook.mode === 'both' ? { content: hook.text, t0: 0, t1: 999 } : null });
   videos.forEach((v, i) => jobs.push({
     src: v, isHook: !hook.clip && i === 0, isLast: i === videos.length - 1, maxSec,
     text: hook.mode === 'text' && i === 0 ? { content: hook.text, t0: 0, t1: textSec } : null,
   }));
+  return jobs;
+}
 
+/** Downloads a source, cuts pauses, prepares subtitles. Returns the job description for the renderer. */
+async function prepareJob(ff, cfg, j, label, transcripts, lut) {
+  status(`${label}: завантажую «${j.src.name}»…`);
+  const bytes = await j.src.get();
+  const id = fileN++;
+  let input = `in${id}${extOf(j.src.name, '.mp4')}`;
+  await ff.writeFile(input, bytes.slice()); // copy: ffmpeg takes ownership of the buffer, the cache keeps the original
+  if (cfg.edit.cutSilence && !j.isHook && !isImage(j.src)) {
+    status(`${label}: вирізаю паузи в «${j.src.name}»…`);
+    input = await cutSilence(ff, logLines, input, cfg.edit.silenceLevel);
+  }
+  if (!j.isHook) lastSource = { name: j.src.name, bytes }; // background for the style preview
+  let srt = null;
+  const srtItem = cfg.subs.source !== 'none' && pool.srts.get(baseName(j.src.name));
+  if (srtItem) { srt = `sub${id}.srt`; await ff.writeFile(srt, (await srtItem.get()).slice()); } else if (cfg.subs.source === 'auto' && !isImage(j.src)) {
+    const caps = await autoCaptions(ff, input, j, cfg, label);
+    if (caps.length) {
+      const { W, H } = dims(cfg);
+      srt = `sub${id}.ass`;
+      await ff.writeFile(srt, buildAss(caps, cfg, W, H));
+      transcripts.push({ name: j.src.name, srt: buildSrt(caps) });
+    }
+  }
+  return { input, name: j.src.name, maxSec: j.maxSec, isHook: j.isHook, isLast: j.isLast, text: j.text, srt, lut };
+}
+async function cleanup(ff, prepared) {
+  for (const p of prepared) {
+    for (const f of [p.input, p.srt]) if (f) { try { await ff.deleteFile(f); } catch (e) { /* already gone */ } }
+  }
+}
+
+/**
+ * Makes one roll. With segCache (several rolls), every clip is rendered once and reused;
+ * a single roll is rendered in one pass (one encode).
+ */
+async function makeOne(ff, plan, n, total, segCache) {
+  const cfg = getCfg();
+  const jobs = jobsFor(plan, cfg);
+  // multi-threaded ffmpeg has only 1 GB: obviously heavy rolls go clip by clip straight away
+  const heavy = MT && !segCache && jobs.length >= 3 && (cfg.edit.boomerang || cfg.fx.leaks || cfg.fx.stabilize || cfg.fx.trails || cfg.fx.motionblur || cfg.format.fit === 'blur' || cfg.format.hd);
+  if (heavy) {
+    const tmp = new Map();
+    const res = await makeOne(ff, plan, n, total, tmp);
+    for (const s of tmp.values()) { try { await (ffmpeg || ff).deleteFile(s.output); } catch (e) { /* ignore */ } }
+    return res;
+  }
   await loadFont(ff, cfg);
-  const segs = [];
   const transcripts = [];
   let lut = null;
   if (cfg.fx.grade === 'lut') {
@@ -343,36 +471,6 @@ async function makeOne(ff, n, total) {
     lut = 'grade.cube';
     await ff.writeFile(lut, (await l.get()).slice());
   }
-  for (let i = 0; i < jobs.length; i++) {
-    const j = jobs[i];
-    const label = `Ролик ${n}/${total} · крок ${i + 1}/${jobs.length + 1}`;
-    status(`${label}: завантажую «${j.src.name}»…`);
-    const bytes = await j.src.get();
-    let input = `in${i}${extOf(j.src.name, '.mp4')}`;
-    await ff.writeFile(input, bytes.slice()); // copy: ffmpeg takes ownership of the buffer, the cache keeps the original
-    if (cfg.edit.cutSilence && !j.isHook && !isImage(j.src)) {
-      status(`${label}: вирізаю паузи в «${j.src.name}»…`);
-      input = await cutSilence(ff, logLines, input, cfg.edit.silenceLevel);
-    }
-    if (!j.isHook || !hook.clip) lastSource = { name: j.src.name, bytes }; // background for the style preview
-    let srt = null;
-    const srtItem = cfg.subs.source !== 'none' && pool.srts.get(baseName(j.src.name));
-    if (srtItem) { srt = `sub${i}.srt`; await ff.writeFile(srt, (await srtItem.get()).slice()); } else if (cfg.subs.source === 'auto' && !isImage(j.src)) {
-      const caps = await autoCaptions(ff, input, j, cfg, label);
-      if (caps.length) {
-        const { W, H } = dims(cfg);
-        srt = `sub${i}.ass`;
-        await ff.writeFile(srt, buildAss(caps, cfg, W, H));
-        transcripts.push({ name: j.src.name, srt: buildSrt(caps) });
-      }
-    }
-    status(`${label}: монтую «${j.src.name}»…`);
-    segs.push(await renderSegment(ff, logLines, cfg, { input, name: j.src.name, maxSec: j.maxSec, isHook: j.isHook, isLast: j.isLast, text: j.text, srt, lut }, `seg${i}.mp4`));
-    await ff.deleteFile(input);
-    if (srt) await ff.deleteFile(srt);
-  }
-
-  status(`Ролик ${n}/${total}: збираю фінальне відео (переходи, звук, ефекти)…`);
   const extras = { music: null, logo: null };
   if (cfg.audio.music && (local.music || pool.music.length)) {
     const m = local.music ? { name: local.music.name, get: async () => new Uint8Array(await local.music.arrayBuffer()) } : pick(pool.music);
@@ -385,24 +483,60 @@ async function makeOne(ff, n, total) {
     extras.logo = 'logo' + extOf(l.name, '.png');
     await ff.writeFile(extras.logo, (await l.get()).slice());
   }
+
   const out = `mix${n}.mp4`;
-  const length = await assemble(ff, logLines, cfg, segs, extras, out);
-  for (const s of segs) await ff.deleteFile(s.output);
-  const base = `junction_mix_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}_${n}`;
+  let length;
+  if (segCache) {
+    const segs = [];
+    for (let i = 0; i < jobs.length; i++) {
+      const j = jobs[i];
+      const key = JSON.stringify([j.src.name, j.isHook, j.isLast, j.maxSec, j.text && j.text.content]);
+      const label = `Ролик ${n}/${total} · кліп ${i + 1}/${jobs.length}`;
+      if (!segCache.has(key)) {
+        const p = await prepareJob(ff, cfg, j, label, transcripts, lut);
+        status(`${label}: монтую «${j.src.name}»…`);
+        segCache.set(key, await renderSegment(ff, logLines, cfg, p, `cseg${segCache.size}.mp4`));
+        await cleanup(ff, [p]);
+      }
+      segs.push(segCache.get(key));
+    }
+    status(`Ролик ${n}/${total}: збираю (переходи, звук, ефекти)…`);
+    length = await assemble(ff, logLines, cfg, segs, extras, out);
+  } else {
+    const prepared = [];
+    for (let i = 0; i < jobs.length; i++) prepared.push(await prepareJob(ff, cfg, jobs[i], `Ролик ${n}/${total} · кліп ${i + 1}/${jobs.length}`, transcripts, lut));
+    status(`Ролик ${n}/${total}: монтую все за один прохід…`);
+    try {
+      length = await renderAll(ff, logLines, cfg, prepared, extras, out);
+    } catch (e) {
+      // too heavy for one pass (usually memory): restart ffmpeg and make this roll clip by clip
+      log('Один прохід не вдався (' + (e.message || e) + '), монтую по кліпах.');
+      status(`Ролик ${n}/${total}: важкий ролик — монтую по кліпах…`);
+      const ff2 = await restartFFmpeg();
+      const tmp = new Map();
+      const res = await makeOne(ff2, plan, n, total, tmp);
+      for (const s of tmp.values()) { try { await ff2.deleteFile(s.output); } catch (err) { /* ignore */ } }
+      return res;
+    }
+    await cleanup(ff, prepared);
+  }
+
+  const base = `${plan.tag}_${slug(plan.hook.clip ? plan.hook.clip.name : plan.hook.text)}_${slug(plan.videos[0].name)}`;
   const files = await exportExtras(ff, cfg, out, length, base, (l) => status(`Ролик ${n}/${total}: готую ${l}…`));
   const data = await ff.readFile(out);
   await ff.deleteFile(out);
   if (lut) await ff.deleteFile(lut);
+  for (const f of [extras.music, extras.logo]) if (f) { try { await ff.deleteFile(f); } catch (e) { /* ignore */ } }
   if (cfg.export.webm) {
     // free the browser's memory first: close this ffmpeg, the next roll starts a fresh one
     status(`Ролик ${n}/${total}: готую WebM…`);
     ff.terminate();
     ffmpeg = null;
-    resetRenderCache();
+    if (segCache) segCache.clear(); // its files lived in the closed ffmpeg
     const webm = await encodeWebm(data.slice());
     if (webm) files.push({ label: 'WebM', name: `${base}.webm`, blob: webm });
   }
-  return { blob: new Blob([data.buffer], { type: 'video/mp4' }), hook, videos, music: extras.musicName, transcripts, files, base };
+  return { blob: new Blob([data.buffer], { type: 'video/mp4' }), hook: plan.hook, videos: plan.videos, music: extras.musicName, transcripts, files, base, tag: plan.tag, length };
 }
 
 // speech → words (cached per file, model, language and length)
@@ -425,7 +559,8 @@ async function autoCaptions(ff, input, job, cfg, label) {
   return groupCaptions(words, +cfg.subs.words || 3, Math.max(8, Math.floor((W * 0.86) / (fs * 0.62))));
 }
 
-function showResult({ blob, hook, videos, music, transcripts = [], files = [], base }) {
+let made = []; // results of the current batch, for the ZIP
+function showResult({ blob, hook, videos, music, transcripts = [], files = [], base, tag, length }) {
   const url = URL.createObjectURL(blob);
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
   const el = document.createElement('div');
@@ -434,7 +569,7 @@ function showResult({ blob, hook, videos, music, transcripts = [], files = [], b
   el.innerHTML = `
     <video src="${url}" controls playsinline></video>
     <div>
-      <b>Готово · ${(blob.size / 1048576).toFixed(1)} МБ</b>
+      <b>${esc(tag || 'Готово')} · ${(length || 0).toFixed(1)} с · ${(blob.size / 1048576).toFixed(1)} МБ</b>
       <ul>
         ${hook.clip ? `<li>Відео-хук: ${esc(hook.clip.name)}</li>` : ''}
         ${hook.text ? `<li>Текстовий хук: «${esc(hook.text)}»</li>` : ''}
@@ -446,6 +581,7 @@ function showResult({ blob, hook, videos, music, transcripts = [], files = [], b
       <a class="btn" href="${url}" download="${base || 'junction_mix_' + stamp}.mp4">Завантажити MP4</a>
     </div>`;
   $('#results').prepend(el);
+  made.push({ base, blob, files, transcripts, hook, videos, music, tag, length });
 }
 
 $('#mix').addEventListener('click', async () => {
@@ -456,21 +592,65 @@ $('#mix').addEventListener('click', async () => {
   }
   const btn = $('#mix');
   btn.disabled = true;
-  const total = Math.max(1, +$('#batch').value || 1);
+  made = [];
+  $('#zipBox').hidden = true;
+  const started = performance.now();
   try {
+    const plans = buildPlans();
+    const total = plans.length;
+    prefetch(plans);
+    const segCache = total > 1 ? new Map() : null;
     await getFFmpeg();
     for (let n = 1; n <= total; n++) {
       progress(0);
-      showResult(await makeOne(await getFFmpeg(), n, total));
+      showResult(await makeOne(await getFFmpeg(), plans[n - 1], n, total, segCache));
     }
-    status(total > 1 ? `Готово: ${total} ролики.` : 'Готово!');
+    if (segCache && ffmpeg) for (const s of segCache.values()) { try { await ffmpeg.deleteFile(s.output); } catch (e) { /* ignore */ } }
+    const secs = Math.round((performance.now() - started) / 1000);
+    status(`${total > 1 ? `Готово: ${total} роликів` : 'Готово!'} За ${secs} с${MT ? ' (багатопотоковий режим)' : ''}.`);
+    if (total > 1) $('#zipBox').hidden = false;
   } catch (e) {
     console.error(e);
     status(e.message || String(e), true);
+    if (made.length > 1) $('#zipBox').hidden = false;
   } finally {
     btn.disabled = false;
     progress(null);
   }
+});
+
+// start downloading every file the batch needs in the background, while the first roll is being made
+function prefetch(plans) {
+  const items = [];
+  for (const p of plans) for (const it of [p.hook.clip, ...p.videos]) if (it && !items.includes(it)) items.push(it);
+  (async () => { for (const it of items) { try { await it.get(); } catch (e) { /* the roll itself will report it */ } } })();
+}
+
+$('#zipBtn').addEventListener('click', async () => {
+  const btn = $('#zipBtn');
+  btn.disabled = true;
+  try {
+    status('Пакую ZIP…');
+    const entries = [];
+    const rows = [['file', 'tag', 'hook_clip', 'hook_text', 'videos', 'music', 'seconds']];
+    for (const m of made) {
+      entries.push({ name: `${m.base}.mp4`, data: new Uint8Array(await m.blob.arrayBuffer()) });
+      for (const f of m.files) entries.push({ name: f.name, data: new Uint8Array(await f.blob.arrayBuffer()) });
+      for (const t of m.transcripts) entries.push({ name: `${m.base}_${t.name.replace(/\.[^.]+$/, '')}.srt`, data: new TextEncoder().encode(t.srt) });
+      rows.push([`${m.base}.mp4`, m.tag, m.hook.clip ? m.hook.clip.name : '', m.hook.text || '', m.videos.map((v) => v.name).join(' + '), m.music || '', (m.length || 0).toFixed(1)]);
+    }
+    // a table of what is in every roll, handy for naming ads and tracking test results
+    const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+    entries.push({ name: 'rolls.csv', data: new TextEncoder().encode('\ufeff' + csv) });
+    const zip = makeZip(entries);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(zip);
+    a.download = `hook-mixer_${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.zip`;
+    a.click();
+    status(`ZIP готовий: ${made.length} роликів, ${(zip.size / 1048576).toFixed(0)} МБ.`);
+  } catch (e) {
+    status('Не вдалося зібрати ZIP: ' + (e.message || e), true);
+  } finally { btn.disabled = false; }
 });
 
 $('#previewBtn').addEventListener('click', async () => {
@@ -508,3 +688,4 @@ $('#previewBtn').addEventListener('click', async () => {
 });
 
 updatePoolInfo();
+updatePlanInfo();

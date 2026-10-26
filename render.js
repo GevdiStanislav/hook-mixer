@@ -8,6 +8,15 @@ const SIZE = { s: 0.05, m: 0.064, l: 0.082 };
 const XFADES = TRANSITIONS.filter((t) => !['none', 'random'].includes(t.id)).map((t) => t.id);
 
 const even = (n) => Math.round(n / 2) * 2;
+
+// Multi-threaded ffmpeg has a fixed pool of threads: decoders and filters stay on one thread,
+// the video encoder (the heaviest part) gets several. Otherwise big rolls can run out of threads and freeze.
+let MT = false;
+export function setThreading(mt) { MT = mt; }
+// pool = 32 threads: up to ~8 video inputs × 2 decoder threads + encoder (≤ 6) + filters (1) stays well inside it
+const inThreads = () => (MT ? ['-threads', '2'] : []);
+const graphThreads = () => (MT ? ['-filter_complex_threads', '1', '-filter_threads', '1'] : []);
+const encThreads = () => (MT ? ['-threads', String(Math.min(6, Math.max(2, (navigator.hardwareConcurrency || 4) - 2)))] : []);
 const r3 = (n) => Number(n).toFixed(3);
 const hex = (c) => '0x' + String(c || '#FFFFFF').replace('#', '');
 const ass = (c, alpha = '00') => { const h = String(c || '#FFFFFF').replace('#', ''); return `&H${alpha}${h.slice(4, 6)}${h.slice(2, 4)}${h.slice(0, 2)}`; };
@@ -192,12 +201,13 @@ const VOICE = {
 };
 
 /**
- * Renders one source into a normalized segment.
+ * Builds the filter graph for one source (one ffmpeg input with index k).
  * job: { input, name, maxSec, isHook, isLast, text: {content, t0, t1}|null, srt: filename|null, lut: filename|null }
- * Returns { output, duration (output seconds), pops: [output-time seconds] }
+ * Returns { inputArgs, graph, v, a, duration (output seconds), pops: [output-time seconds] }
  */
-export async function renderSegment(ff, logs, cfg, job, output, { final = false } = {}) {
+export async function buildSegment(ff, logs, cfg, job, k) {
   const { W, H } = dims(cfg);
+  const L = (name) => `[${name}${k}]`;
   const speed = Math.min(2, Math.max(0.5, +cfg.format.speed || 1));
   const img = isImage(job.name);
   const ed = cfg.edit || {};
@@ -211,6 +221,7 @@ export async function renderSegment(ff, logs, cfg, job, output, { final = false 
     dur = info.duration || 5;
     if (job.maxSec > 0) dur = Math.min(dur, job.maxSec);
   }
+  dur = Math.max(0.2, Math.floor(dur * 30) / 30); // whole frames, so the predicted length is exact
   const boomerang = ed.boomerang && job.isHook && !img;
   const freeze = ed.freeze && job.isLast ? 1 : 0;
   const outDur = (dur / speed) * (boomerang ? 2 : 1) + freeze;
@@ -223,8 +234,10 @@ export async function renderSegment(ff, logs, cfg, job, output, { final = false 
   if (rot === 180) pre.push('transpose=1,transpose=1');
   if (rot === 270) pre.push('transpose=2');
   if (ed.mirror) pre.push('hflip');
-  const src = pre.length ? `[0:v]${pre.join(',')}[pre];` : '';
-  let filter = src + fitChain(cfg, W, H, pre.length ? '[pre]' : '[0:v]', '[fit]');
+  const inV = `[${k}:v]`;
+  const g = [];
+  if (pre.length) g.push(`${inV}${pre.join(',')}${L('pre')}`);
+  g.push(fitChain(cfg, W, H, pre.length ? L('pre') : inV, L('fit')).replace(/\[(fa|fb|fbg|ffg)\]/g, (m, n) => L(n)));
 
   // look
   const look = [];
@@ -238,23 +251,24 @@ export async function renderSegment(ff, logs, cfg, job, output, { final = false 
     look.push(`scale=${sw}:-2,crop=${W}:${H}:x='(iw-ow)/2+(iw-ow)/2*sin(t*55)*lt(t,0.7)':y='(ih-oh)/2+(ih-oh)/2*cos(t*47)*lt(t,0.7)'`);
   }
   look.push('format=yuv420p');
-  filter += `;[fit]${look.join(',')}[lk0]`;
-  let cur = '[lk0]';
+  g.push(`${L('fit')}${look.join(',')}${L('lk0')}`);
+  let cur = L('lk0');
   if (cfg.fx.leaks) {
-    filter += `;gradients=s=${W}x${H}:r=30:d=${r3(dur + 1)}:n=3:c0=0xff8a00:c1=0xff3b5c:c2=0x000000:speed=0.012,format=yuv420p[lkg];${cur}[lkg]blend=all_mode=screen:all_opacity=0.32:shortest=1[lk1]`;
-    cur = '[lk1]';
+    g.push(`gradients=s=${W}x${H}:r=30:d=${r3(dur + 1)}:n=3:c0=0xff8a00:c1=0xff3b5c:c2=0x000000:speed=0.012,format=yuv420p${L('lkg')}`);
+    g.push(`${cur}${L('lkg')}blend=all_mode=screen:all_opacity=0.32:shortest=1${L('lk1')}`);
+    cur = L('lk1');
   }
   if (cfg.fx.letterbox) {
     const bar = Math.round(H * (W > H ? 0.11 : 0.08));
-    filter += `;${cur}drawbox=x=0:y=0:w=iw:h=${bar}:color=black:t=fill,drawbox=x=0:y=ih-${bar}:w=iw:h=${bar}:color=black:t=fill[lk2]`;
-    cur = '[lk2]';
+    g.push(`${cur}drawbox=x=0:y=0:w=iw:h=${bar}:color=black:t=fill,drawbox=x=0:y=ih-${bar}:w=iw:h=${bar}:color=black:t=fill${L('lk2')}`);
+    cur = L('lk2');
   }
 
   // text on top of effects
   let pops = [];
   if (job.text) {
     const tf = await textFilters(ff, cfg, { text: job.text.content, t0: job.text.t0, t1: Math.min(job.text.t1, dur), W, H, anim: cfg.anim });
-    if (tf.filters.length) { filter += `;${cur}${tf.filters.join(',')}[tx]`; cur = '[tx]'; }
+    if (tf.filters.length) { g.push(`${cur}${tf.filters.join(',')}${L('tx')}`); cur = L('tx'); }
     pops = tf.pops.map((p) => p / speed);
   }
 
@@ -264,31 +278,55 @@ export async function renderSegment(ff, logs, cfg, job, output, { final = false 
   if (cfg.audio.denoise && cfg.audio.voice !== 'clean') aChain += ',afftdn=nf=-25';
   if (voice) aChain += ',' + voice;
   aChain += `,volume=${cfg.audio.origVol}`;
-  let aCur;
-  if (hasAudio) { filter += `;[0:a]${aChain}[a0]`; aCur = '[a0]'; } else { filter += `;anullsrc=r=44100:cl=stereo,atrim=duration=${r3(dur)}[a0]`; aCur = '[a0]'; }
+  if (hasAudio) g.push(`[${k}:a]${aChain}${L('a0')}`);
+  else g.push(`anullsrc=r=44100:cl=stereo,atrim=duration=${r3(dur)}${L('a0')}`);
+  let aCur = L('a0');
 
   // boomerang: play forward, then backwards
   if (boomerang) {
-    filter += `;${cur}split[bf][bb];[bb]reverse[br];[bf][br]concat=n=2:v=1:a=0[bv]`;
-    filter += `;${aCur}asplit[af][ab];[ab]areverse[ar];[af][ar]concat=n=2:v=0:a=1[ba]`;
-    cur = '[bv]';
-    aCur = '[ba]';
+    g.push(`${cur}split${L('bf')}${L('bb')}`, `${L('bb')}reverse${L('br')}`, `${L('bf')}${L('br')}concat=n=2:v=1:a=0${L('bv')}`);
+    g.push(`${aCur}asplit${L('af')}${L('ab')}`, `${L('ab')}areverse${L('ar')}`, `${L('af')}${L('ar')}concat=n=2:v=0:a=1${L('ba')}`);
+    cur = L('bv');
+    aCur = L('ba');
   }
   const vTail = [];
   const aTail = [];
   if (speed !== 1) { vTail.push(`setpts=PTS/${speed}`); aTail.push(`atempo=${speed}`); }
   if (freeze) { vTail.push(`tpad=stop_mode=clone:stop_duration=${freeze}`); aTail.push(`apad=pad_dur=${freeze}`); }
-  vTail.push('format=yuv420p');
-  filter += `;${cur}${vTail.join(',')}[v]`;
-  filter += `;${aCur}${aTail.length ? aTail.join(',') : 'anull'}[a]`;
+  // exact length, so transitions line up without re-measuring
+  // same frame rate, time base and format for every clip, so transitions can join them
+  vTail.push(`trim=duration=${r3(outDur)},setpts=PTS-STARTPTS,fps=30,settb=1/30,setsar=1,format=yuv420p`);
+  aTail.push(`apad,atrim=duration=${r3(outDur)},asetpts=PTS-STARTPTS,aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,asettb=1/44100`);
+  g.push(`${cur}${vTail.join(',')}${L('v')}`);
+  g.push(`${aCur}${aTail.join(',')}${L('a')}`);
 
-  const input = img ? ['-loop', '1', '-t', r3(dur), '-i', job.input] : ['-t', r3(dur), '-i', job.input];
-  const enc = final ? encodeArgs(cfg) : ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '19'];
-  const code = await ff.exec(['-hide_banner', '-y', ...input, '-filter_complex', filter, '-map', '[v]', '-map', '[a]',
-    '-t', r3(outDur), ...enc, '-r', '30', '-c:a', 'aac', '-b:a', '160k', '-ar', '44100', '-ac', '2', output]);
+  const inputArgs = img ? [...inThreads(), '-loop', '1', '-t', r3(dur), '-i', job.input] : [...inThreads(), '-t', r3(dur), '-i', job.input];
+  return { inputArgs, graph: g.join(';'), v: L('v'), a: L('a'), duration: outDur, pops };
+}
+
+/** Renders one source into its own file (used when the same clip is reused across many rolls). */
+export async function renderSegment(ff, logs, cfg, job, output, { final = false } = {}) {
+  const s = await buildSegment(ff, logs, cfg, job, 0);
+  const enc = final ? encodeArgs(cfg) : ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '19', ...encThreads()];
+  const code = await ff.exec(['-hide_banner', '-y', ...graphThreads(), ...s.inputArgs, '-filter_complex', s.graph, '-map', s.v, '-map', s.a,
+    '-t', r3(s.duration), ...enc, '-r', '30', '-c:a', 'aac', '-b:a', '160k', '-ar', '44100', '-ac', '2', output]);
   if (code !== 0) throw new Error(`ffmpeg не зміг обробити «${job.name}». Подивись журнал унизу.`);
   const real = await probe(ff, logs, output);
-  return { output, duration: real.duration || outDur, pops };
+  return { output, duration: real.duration || s.duration, pops: s.pops };
+}
+
+/** One-pass render: every source and every effect in a single ffmpeg run (one encode instead of two). */
+export async function renderAll(ff, logs, cfg, jobs, extras, output) {
+  const args = ['-hide_banner', '-y', ...graphThreads()];
+  const parts = [];
+  const segs = [];
+  for (let k = 0; k < jobs.length; k++) {
+    const s = await buildSegment(ff, logs, cfg, jobs[k], k);
+    args.push(...s.inputArgs);
+    parts.push(s.graph);
+    segs.push({ v: s.v, a: s.a, duration: s.duration, pops: s.pops });
+  }
+  return assemble(ff, logs, cfg, segs, extras, output, { args, parts });
 }
 
 const SILENCE = { soft: [-38, 0.6], mid: [-32, 0.4], hard: [-27, 0.28] };
@@ -330,7 +368,7 @@ export async function cutSilence(ff, logs, input, level = 'mid') {
 }
 
 function encodeArgs(cfg) {
-  return cfg.format.compact ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '25'] : ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '25'];
+  return [...(cfg.format.compact ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '25'] : ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '25']), ...encThreads()];
 }
 
 const hasHandle = (cfg) => cfg.brand && cfg.brand.enabled && String(cfg.brand.handle || '').trim();
@@ -344,20 +382,22 @@ export const needsFinalPass = (cfg, nSegs, extras) =>
  * segs: [{output, duration, pops}]; extras: { music: filename|null, logo: filename|null }
  * Returns the total duration in seconds.
  */
-export async function assemble(ff, logs, cfg, segs, extras, output) {
+export async function assemble(ff, logs, cfg, segs, extras, output, pre = null) {
   const { W, H } = dims(cfg);
   const n = segs.length;
-  if (!needsFinalPass(cfg, n, extras)) {
+  if (!pre && !needsFinalPass(cfg, n, extras)) {
     await ff.writeFile('list.txt', segs.map((s) => `file '${s.output}'`).join('\n'));
     const code = await ff.exec(['-hide_banner', '-y', '-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', '-movflags', '+faststart', output]);
     if (code !== 0) throw new Error('Не вдалося склеїти відео. Подивись журнал унизу.');
     return segs.reduce((s, x) => s + x.duration, 0);
   }
 
-  const args = ['-hide_banner', '-y'];
-  segs.forEach((s) => args.push('-i', s.output));
+  const args = pre ? pre.args : ['-hide_banner', '-y', ...graphThreads()];
+  if (!pre) segs.forEach((s) => args.push(...inThreads(), '-i', s.output));
   let idx = n;
-  const parts = [];
+  const parts = pre ? pre.parts : [];
+  const sv = (k) => segs[k].v || `[${k}:v]`;
+  const sa = (k) => segs[k].a || `[${k}:a]`;
 
   // 1) join segments: transitions (xfade) or plain concat
   const starts = [0];
@@ -365,14 +405,14 @@ export async function assemble(ff, logs, cfg, segs, extras, output) {
   const useX = cfg.transition.type !== 'none' && n > 1;
   if (useX) {
     let acc = segs[0].duration;
-    let v = '[0:v]';
-    let a = '[0:a]';
+    let v = sv(0);
+    let a = sa(0);
     for (let k = 1; k < n; k++) {
       const T = Math.max(0.1, Math.min(+cfg.transition.duration || 0.4, segs[k - 1].duration * 0.45, segs[k].duration * 0.45));
       const type = cfg.transition.type === 'random' ? XFADES[Math.floor(Math.random() * XFADES.length)] : cfg.transition.type;
       const off = acc - T;
-      parts.push(`${v}[${k}:v]xfade=transition=${type}:duration=${r3(T)}:offset=${r3(off)}[vx${k}]`);
-      parts.push(`${a}[${k}:a]acrossfade=d=${r3(T)}[ax${k}]`);
+      parts.push(`${v}${sv(k)}xfade=transition=${type}:duration=${r3(T)}:offset=${r3(off)}[vx${k}]`);
+      parts.push(`${a}${sa(k)}acrossfade=d=${r3(T)}[ax${k}]`);
       v = `[vx${k}]`;
       a = `[ax${k}]`;
       starts.push(off);
@@ -384,7 +424,7 @@ export async function assemble(ff, logs, cfg, segs, extras, output) {
     let acc = 0;
     segs.forEach((s, k) => { if (k) starts.push(acc); acc += s.duration; });
     total = acc;
-    parts.push(segs.map((s, k) => `[${k}:v][${k}:a]`).join('') + `concat=n=${n}:v=1:a=1[vj][aj]`);
+    parts.push(segs.map((s, k) => sv(k) + sa(k)).join('') + `concat=n=${n}:v=1:a=1[vj][aj]`);
   }
 
   // 2) video extras
@@ -410,7 +450,7 @@ export async function assemble(ff, logs, cfg, segs, extras, output) {
     vl = '[vh]';
   }
   if (extras.logo) {
-    args.push('-i', extras.logo);
+    args.push(...inThreads(), '-i', extras.logo);
     const lw = even(W * (+cfg.logo.size || 0.18));
     const m = Math.round(Math.min(W, H) * 0.04);
     const pos = { tl: `${m}:${m}`, tr: `W-w-${m}:${m}`, bl: `${m}:H-h-${m}`, br: `W-w-${m}:H-h-${m}` }[cfg.logo.position] || `W-w-${m}:${m}`;
@@ -429,7 +469,7 @@ export async function assemble(ff, logs, cfg, segs, extras, output) {
   let voice = '[aj]';
   const mix = [];
   if (extras.music) {
-    args.push('-stream_loop', '-1', '-i', extras.music);
+    args.push(...inThreads(), '-stream_loop', '-1', '-i', extras.music);
     const fo = Math.max(0, total - 1.5);
     const fin = cfg.audio.musicFadeIn ? ',afade=t=in:st=0:d=1' : '';
     parts.push(`[${idx}:a]aresample=44100,aformat=channel_layouts=stereo,atrim=duration=${r3(total)},asetpts=N/SR/TB,volume=${cfg.audio.musicVol}${fin},afade=t=out:st=${r3(fo)}:d=1.5[mus]`);
@@ -457,7 +497,7 @@ export async function assemble(ff, logs, cfg, segs, extras, output) {
   for (const [id, at] of hits) {
     if (at >= total) continue;
     const file = await loadSfx(ff, id);
-    args.push('-i', file);
+    args.push(...inThreads(), '-i', file);
     const ms = Math.round(at * 1000);
     parts.push(`[${idx}:a]aresample=44100,aformat=channel_layouts=stereo,volume=${cfg.audio.sfxVol},adelay=${ms}|${ms}[sx${idx}]`);
     mix.push(`[sx${idx}]`);

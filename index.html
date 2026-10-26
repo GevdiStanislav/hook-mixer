@@ -55,6 +55,7 @@
       </label>
 
       <p id="pool" class="muted small">Файли ще не завантажені.</p>
+      <button type="button" class="link" id="clearCache">Очистити кеш файлів</button>
     </section>
 
     <section class="card">
@@ -73,8 +74,15 @@
         <label>Відео в одному ролику
           <input id="count" type="number" min="1" max="10" value="1">
         </label>
-        <label>Скільки роликів зробити
-          <input id="batch" type="number" min="1" max="10" value="1">
+        <label>Як поєднувати
+          <select id="pickMode">
+            <option value="random">Випадково</option>
+            <option value="matrix">Усі комбінації хук × відео</option>
+            <option value="eachHook">Кожен хук по разу</option>
+          </select>
+        </label>
+        <label id="batchWrap">Скільки роликів зробити
+          <input id="batch" type="number" min="1" max="60" value="1">
         </label>
         <label>Тип хука
           <select id="hookMode">
@@ -93,7 +101,9 @@
       </div>
       <button id="mix" class="btn big" type="button">Поєднати</button>
       <div class="progress" hidden><div id="bar"></div></div>
+      <p id="planInfo" class="muted small"></p>
       <p id="status" class="muted small"></p>
+      <div id="zipBox" hidden><button id="zipBtn" class="btn ghost" type="button">Завантажити всі ролики (ZIP + таблиця)</button></div>
     </section>
 
     <section id="results"></section>
